@@ -22,42 +22,37 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
-type AskTaskArgs struct {
+// TaskType indicates what kind of work the coordinator is assigning.
+type TaskType int
+
+const (
+	TaskMap TaskType = iota
+	TaskReduce
+	TaskWait
+	TaskExit
+)
+
+// Task describes a unit of work for a worker.
+type Task struct {
+	Type    TaskType
+	File    string
+	TaskId  int
+	NReduce int
+	NMap    int
 }
 
-type AskTaskReply struct {
-	Task       string
-	SartReduce bool
+type GetTaskArgs struct{}
+
+type GetTaskReply struct {
+	Task Task
 }
 
-type AskReduceNumArgs struct {
+type ReportTaskArgs struct {
+	TaskType TaskType
+	TaskId   int
 }
 
-type AskReduceNumReply struct {
-	ReduceNum int
-}
-
-type AskReduceArgs struct {
-}
-
-type AskReduceReply struct {
-	ReduceNum int
-}
-
-type MapSuccessArgs struct {
-	Task string
-}
-
-type MapSuccessReply struct {
-}
-
-type ReduceSuccessArgs struct {
-	ReduceNum int
-}
-
-type ReduceSuccessReply struct {
-}
+type ReportTaskReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

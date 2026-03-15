@@ -2,120 +2,108 @@ package mr
 
 import (
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
 	"time"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-import "sync"
+
+type TaskState int
+
+const (
+	TaskIdle TaskState = iota
+	TaskInProgress
+	TaskCompleted
+)
+
+type TaskMeta struct {
+	state     TaskState
+	startTime time.Time
+}
 
 type Coordinator struct {
-	mutex       sync.Mutex
-	mapIndex    int
-	reduceIndex int
-	files       []string
-	map1        map[int]bool //false 未完成且计时不到10s true 未完成且计时已过10s
-	reducePhase bool
-	nReduce     int
+	mu         sync.Mutex
+	files      []string
+	nReduce    int
+	mapMeta    []TaskMeta
+	reduceMeta []TaskMeta
 }
 
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	//fmt.Println("Coordinator Example excuted")
 	reply.Y = args.X + 1
 	return nil
 }
 
-func (c *Coordinator) ReduceNum(args *AskReduceNumArgs, reply *AskReduceNumReply) error {
-	reply.ReduceNum = c.nReduce
-	return nil
-}
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-func (c *Coordinator) AskReduce(args *AskReduceArgs, reply *AskReduceReply) error {
-	//fmt.Println("coordinator AskReduce called")
-	//fmt.Println("c.reduceIndex = ", c.reduceIndex)
+	c.resetExpired()
 
-	if c.reduceIndex < c.nReduce {
-		reply.ReduceNum = c.reduceIndex + 1
-		//fmt.Println("reply.ReduceNum : ", reply.ReduceNum)
-		c.map1[c.reduceIndex] = false
-		i := c.reduceIndex
-		go c.waitWorker(i)
-		c.reduceIndex++
-	} else if len(c.map1) > 0 {
-		key := -1
-		for k, v := range c.map1 {
-			if v {
-				key = k
-				break
+	if !c.allMapsDone() {
+		for i := range c.mapMeta {
+			if c.mapMeta[i].state == TaskIdle {
+				c.mapMeta[i].state = TaskInProgress
+				c.mapMeta[i].startTime = time.Now()
+				reply.Task = Task{
+					Type:    TaskMap,
+					File:    c.files[i],
+					TaskId:  i,
+					NReduce: c.nReduce,
+					NMap:    len(c.files),
+				}
+				return nil
 			}
 		}
-		if key >= 0 {
-			reply.ReduceNum = key + 1
-			c.map1[key] = false
-			i := key
-			go c.waitWorker(i)
-		}
-	}
-
-	return nil
-}
-
-func (c *Coordinator) Asktask(args *AskTaskArgs, reply *AskTaskReply) error {
-	//fmt.Println("Coordinator asktast excuted")
-	//for key, value := range c.map1 {
-	//	fmt.Println(time.Now(), "Key/Value: ", key, value)
-	//}
-	//fmt.Println()
-	if c.reducePhase {
-		reply.SartReduce = true
+		reply.Task = Task{Type: TaskWait}
 		return nil
 	}
 
-	if c.mapIndex < len(c.files) {
-		reply.Task = c.files[c.mapIndex]
-		c.map1[c.mapIndex] = false
-		i := c.mapIndex
-		go c.waitWorker(i)
-		c.mapIndex++
-	} else if len(c.map1) > 0 {
-		key := -1
-		for k, v := range c.map1 {
-			if v {
-				key = k
-				break
+	if !c.allReducesDone() {
+		for i := range c.reduceMeta {
+			if c.reduceMeta[i].state == TaskIdle {
+				c.reduceMeta[i].state = TaskInProgress
+				c.reduceMeta[i].startTime = time.Now()
+				reply.Task = Task{
+					Type:    TaskReduce,
+					TaskId:  i,
+					NReduce: c.nReduce,
+					NMap:    len(c.files),
+				}
+				return nil
 			}
 		}
-		if key >= 0 {
-			reply.Task = c.files[key]
-			c.map1[key] = false
-			i := key
-			go c.waitWorker(i)
-		}
-	} else {
-		c.reducePhase = true
-		reply.SartReduce = true
+		reply.Task = Task{Type: TaskWait}
+		return nil
 	}
 
+	reply.Task = Task{Type: TaskExit}
 	return nil
 }
 
-func (c *Coordinator) MapSuccess(args *MapSuccessArgs, reply *MapSuccessReply) error {
-	var i int
-	for i = 0; i < len(c.files); i++ {
-		if c.files[i] == args.Task {
-			break
+func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch args.TaskType {
+	case TaskMap:
+		if args.TaskId >= 0 && args.TaskId < len(c.mapMeta) {
+			if c.mapMeta[args.TaskId].state != TaskCompleted {
+				c.mapMeta[args.TaskId].state = TaskCompleted
+			}
+		}
+	case TaskReduce:
+		if args.TaskId >= 0 && args.TaskId < len(c.reduceMeta) {
+			if c.reduceMeta[args.TaskId].state != TaskCompleted {
+				c.reduceMeta[args.TaskId].state = TaskCompleted
+			}
 		}
 	}
-	delete(c.map1, i)
-	return nil
-}
-
-func (c *Coordinator) ReduceSuccess(args *ReduceSuccessArgs, reply *ReduceSuccessReply) error {
-	delete(c.map1, args.ReduceNum)
 	return nil
 }
 
@@ -123,48 +111,65 @@ func (c *Coordinator) ReduceSuccess(args *ReduceSuccessArgs, reply *ReduceSucces
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
-	go http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-		http.DefaultServeMux.ServeHTTP(w, r)
-	}))
+	go http.Serve(l, nil)
 }
 
-func (c *Coordinator) waitWorker(mapId int) {
-	time.Sleep(10 * time.Second)
-	_, exists := c.map1[mapId]
-	if exists {
-		c.map1[mapId] = true
+func (c *Coordinator) resetExpired() {
+	now := time.Now()
+	for i := range c.mapMeta {
+		if c.mapMeta[i].state == TaskInProgress && now.Sub(c.mapMeta[i].startTime) > 10*time.Second {
+			c.mapMeta[i].state = TaskIdle
+		}
 	}
+	for i := range c.reduceMeta {
+		if c.reduceMeta[i].state == TaskInProgress && now.Sub(c.reduceMeta[i].startTime) > 10*time.Second {
+			c.reduceMeta[i].state = TaskIdle
+		}
+	}
+}
+
+func (c *Coordinator) allMapsDone() bool {
+	for i := range c.mapMeta {
+		if c.mapMeta[i].state != TaskCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) allReducesDone() bool {
+	for i := range c.reduceMeta {
+		if c.reduceMeta[i].state != TaskCompleted {
+			return false
+		}
+	}
+	return true
 }
 
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	if c.reducePhase && c.reduceIndex == c.nReduce && len(c.map1) == 0 {
-		return true
-	}
-	return false
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.allMapsDone() && c.allReducesDone()
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-func MakeCoordinator(files_ []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	c.mapIndex = 0
-	c.reduceIndex = 0
-	c.files = files_
-	c.reducePhase = false
-	c.nReduce = nReduce
-	c.map1 = make(map[int]bool)
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := Coordinator{
+		files:      files,
+		nReduce:    nReduce,
+		mapMeta:    make([]TaskMeta, len(files)),
+		reduceMeta: make([]TaskMeta, nReduce),
+	}
 	c.server()
 	return &c
 }
