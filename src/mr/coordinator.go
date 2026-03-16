@@ -23,6 +23,8 @@ type TaskMeta struct {
 	startTime time.Time
 }
 
+const taskTimeout = 15 * time.Second
+
 type Coordinator struct {
 	mu         sync.Mutex
 	files      []string
@@ -123,12 +125,12 @@ func (c *Coordinator) server() {
 func (c *Coordinator) resetExpired() {
 	now := time.Now()
 	for i := range c.mapMeta {
-		if c.mapMeta[i].state == TaskInProgress && now.Sub(c.mapMeta[i].startTime) > 10*time.Second {
+		if c.mapMeta[i].state == TaskInProgress && now.Sub(c.mapMeta[i].startTime) > taskTimeout {
 			c.mapMeta[i].state = TaskIdle
 		}
 	}
 	for i := range c.reduceMeta {
-		if c.reduceMeta[i].state == TaskInProgress && now.Sub(c.reduceMeta[i].startTime) > 10*time.Second {
+		if c.reduceMeta[i].state == TaskInProgress && now.Sub(c.reduceMeta[i].startTime) > taskTimeout {
 			c.reduceMeta[i].state = TaskIdle
 		}
 	}

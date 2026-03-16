@@ -82,7 +82,8 @@ func reportTask(task Task) {
 		TaskId:   task.TaskId,
 	}
 	reply := ReportTaskReply{}
-	for i := 0; i < 5; i++ {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		if call("Coordinator.ReportTask", &args, &reply) {
 			return
 		}
