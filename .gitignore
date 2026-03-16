@@ -4,3 +4,4 @@ api.key
 *-handin.tar.gz
 .idea
 .DS_Store
+src/bin
