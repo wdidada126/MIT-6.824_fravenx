@@ -1,5 +1,64 @@
 # my
 
+## mac
+go 1.17不行，换go版本
+export GOROOT="/Users/ibqo/development/go"
+export PATH="/Users/ibqo/development/go/bin:$PATH"
+
+ibqodeMBP:mit-6.824_fravenx ibqo$  export PATH="/Users/ibqo/development/go/bin:$PATH"
+ibqodeMBP:mit-6.824_fravenx ibqo$ go version
+go version go1.24.6 darwin/amd64
+ibqodeMBP:mit-6.824_fravenx ibqo$ go env
+AR='ar'
+CC='clang'
+CGO_CFLAGS='-O2 -g'
+CGO_CPPFLAGS=''
+CGO_CXXFLAGS='-O2 -g'
+CGO_ENABLED='1'
+CGO_FFLAGS='-O2 -g'
+CGO_LDFLAGS='-O2 -g'
+CXX='clang++'
+GCCGO='gccgo'
+GO111MODULE='on'
+GOAMD64='v1'
+GOARCH='amd64'
+GOAUTH='netrc'
+GOBIN=''
+GOCACHE='/Users/ibqo/Library/Caches/go-build'
+GOCACHEPROG=''
+GODEBUG=''
+GOENV='/Users/ibqo/Library/Application Support/go/env'
+GOEXE=''
+GOEXPERIMENT=''
+GOFIPS140='off'
+GOFLAGS=''
+GOGCCFLAGS='-fPIC -arch x86_64 -m64 -pthread -fno-caret-diagnostics -Qunused-arguments -fmessage-length=0 -ffile-prefix-map=/var/folders/vk/_xdm46qn66182z1cy9k7qvr80000gn/T/go-build3066368003=/tmp/go-build -gno-record-gcc-switches -fno-common'
+GOHOSTARCH='amd64'
+GOHOSTOS='darwin'
+GOINSECURE=''
+GOMOD='/dev/null'
+GOMODCACHE='/Users/ibqo/go/pkg/mod'
+GONOPROXY=''
+GONOSUMDB=''
+GOOS='darwin'
+GOPATH='/Users/ibqo/go'
+GOPRIVATE=''
+GOPROXY='https://goproxy.cn,direct'
+GOROOT='/usr/local/go'
+GOSUMDB=''
+GOTELEMETRY='local'
+GOTELEMETRYDIR='/Users/ibqo/Library/Application Support/go/telemetry'
+GOTMPDIR=''
+GOTOOLCHAIN=''
+GOTOOLDIR='/usr/local/go/pkg/tool/darwin_amd64'
+GOVCS=''
+GOVERSION='go1.24.6'
+GOWORK=''
+PKG_CONFIG='pkg-config'
+ibqodeMBP:mit-6.824_fravenx ibqo$
+
+## doc script
+
 - go build -o ./bin/mrcoordinator ./main/mrcoordinator.go
 - go build -o ./bin/mrworker ./main/mrworker.go
 - go build -o ./bin/mrsequential ./main/mrsequential.go
@@ -9,7 +68,6 @@
 
 - go run ./main/mrcoordinator.go
 - go run ./mrapps/wc.go
-
 
 ibqo@ibqodeMBP src % go test ./raft
 ok      6.5840/raft     302.763s
@@ -53,6 +111,9 @@ go version go1.16.6 linux/amd64
 
 cd src/main
 ./test-mr.sh
+
+ibqo@ibqodeMBP src % go test ./kvraft
+ok      6.5840/kvraft   393.121s
 
 ```shell
 ibqodeMBP:main ibqo$ ./test-mr.sh
