@@ -5,6 +5,7 @@ go 1.17不行，换go版本
 export GOROOT="/Users/ibqo/development/go"
 export PATH="/Users/ibqo/development/go/bin:$PATH"
 
+```
 ibqodeMBP:mit-6.824_fravenx ibqo$  export PATH="/Users/ibqo/development/go/bin:$PATH"
 ibqodeMBP:mit-6.824_fravenx ibqo$ go version
 go version go1.24.6 darwin/amd64
@@ -56,9 +57,11 @@ GOVERSION='go1.24.6'
 GOWORK=''
 PKG_CONFIG='pkg-config'
 ibqodeMBP:mit-6.824_fravenx ibqo$
+```
+
 
 ## doc script
-
+```
 - go build -o ./bin/mrcoordinator ./main/mrcoordinator.go
 - go build -o ./bin/mrworker ./main/mrworker.go
 - go build -o ./bin/mrsequential ./main/mrsequential.go
@@ -68,9 +71,12 @@ ibqodeMBP:mit-6.824_fravenx ibqo$
 
 - go run ./main/mrcoordinator.go
 - go run ./mrapps/wc.go
+```
 
+```
 ibqo@ibqodeMBP src % go test ./raft
 ok      6.5840/raft     302.763s
+```
 
 运行并编译测试（这是课程默认用法）：
 - raft：go test ./raft
@@ -105,15 +111,25 @@ https://github.com/wdidada126/6.5840-golabs-2023
 
 Lab of MIT 6.824 2023 所有lab 稳定通过一万次以上 All labs stably passed 10,000 times
 
+
+```shell
 'go version'
 go version go1.16.6 linux/amd64
+```
+
 低版本go不行
 
+```shell
 cd src/main
 ./test-mr.sh
+```
 
+
+```shell
 ibqo@ibqodeMBP src % go test ./kvraft
 ok      6.5840/kvraft   393.121s
+```
+
 
 ```shell
 ibqodeMBP:main ibqo$ ./test-mr.sh
@@ -149,6 +165,8 @@ ld: warning: -no_pie is deprecated when targeting new OS versions
 *** PASSED ALL TESTS
 ```
 
+
+```shell
 cd src/labrpc
 go test -v
 === RUN   TestTypes
@@ -174,10 +192,15 @@ go test -v
 --- PASS: TestBenchmark (1.27s)
 PASS
 ok      6.5840/labrpc   2.511s
+```
 
+
+```shell
 cd src/labgob
 go test -v
+```
 
+```shell
 cd src/shardctrler
 wdidada@LAPTOP-wdidada:/mnt/d/develops/git/github/go/MIT-6.824_fravenx/src/shardctrler$ go test -v
 === RUN   TestBasic4A
@@ -502,12 +525,14 @@ Test: Check Same config on servers ...
 --- PASS: TestMulti4A (1.29s)
 PASS
 ok      6.5840/shardctrler      2.929s
+```
 
-
+```
 cd src/shardkv
 go test -v
+```
 
-
+```
 wdidada@LAPTOP-wdidada:/mnt/d/develops/git/github/go/MIT-6.824_fravenx/src/shardctrler$ cd src/shardkv
 go test -v
 
@@ -835,7 +860,9 @@ Test: Check Same config on servers ...
 --- PASS: TestMulti4A (1.42s)
 PASS
 ok      6.5840/shardctrler      2.922s
+```
 
+```
 cd src/kvraft
 3A 3B
 wdidada@LAPTOP-wdidada:/mnt/d/develops/git/github/go/MIT-6.824_fravenx/src/kvraft$ go test -v
@@ -858,3 +885,4 @@ Test: unreliable net, restarts, partitions, snapshots, random keys, many clients
 --- PASS: TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B (31.89s)
 PASS
 ok      6.5840/kvraft   391.454s
+```
