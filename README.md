@@ -122,57 +122,36 @@
 
 1. 在server的RPC处理中，为了等待从appier中出来的命令响应Clerk而设置的chan，一定不要使用默认的无缓冲的chan，而要设置一个缓冲空间为1（一个client只会有一个命令at the moment），由于默认的chan是同步的，server中RPC请求和appier两者阻塞，系统会超时，命令一直无法完成 
 
-   
-
 2. client除了在Err为ErrWrongLeader需要更换leader，在调用RPC请求ok为false时也要更换leader，否则系统会超时，一直无响应。
-
-   
 
 3. client的clientId和seqno要写入Op结构体中，此操作是为了让follower的table能够同步更新，从而保证请求只会被执行一次。
 
 ### 3B
-
 1. raftState大于阈值时持久化server的data和记录客户端最新序列号的table，以及sever启动时读取已保存的data和table。
 
 2. 增加follower能够快速catch up的机制：
-
    1）在appendentrie的RPC请求中，若回复为false（preEntry检测策略失败），立即向该follower再次发送appendentries的RPC请求，而不要等到下一次心跳时间
-
    2）若leader更新了commitIndex，立即向其余follower发送心跳，以便follower也能够更新commitIndex
-
    3）在leader发送快照的请求中，此follower可能已经落后较多条日志，在发送完日志，收到肯定回复后，立即再次向该节点发送心跳。
-
    否则lab2能够稳定通过，而3B会超时。
 
 ### 4A
-
 1. Rebalance函数的设计:
-
    用一个map记录gid到shard的映射，统计map中每个gid对应的shard数组的最大值和最小值，只要相差大于1时，不断移动最大shard数组中部分元素到最小shard数组中，并更新config.Shards，当gid为0的shard数组不为空时，优先清空gid为0的shard数组(gid非0)
 
 ### 4B + 2challenges
 
 1. 如何更新配置：
-
    单独开一个协程，不断轮训shardctrler节点最新配置，写入日志，等配置从applych接收到后，保证集群组中的配置同步更新。为了保证配置one by one更新，只有leader节点的每个shard都处于正常状态时才会拉取配置。
-
-   
 
 2. 节点维护上一个配置，当前配置和每个shard的状态，在持久化时写入
 
-   
-
 3. 维护每个shard的三个状态：
-
    1）Working 正常状态
-
    2）Missing  上一配置有此shard，当前配置没有
-
    3）Adding   上一配置没有此shard，当前配置有
 
    节点收到client请求时，判断key对应的shard状态是否正常，若shard不是Working状态，则拒绝执行
-
-   
 
 4. 单独开一个协程，leader不断轮训是否有shard需要转发，由leader发送PushShardRPC，其中args包括给新集群的data，节点自身的判重数组，发送给该gid的shards数组，目标集群收到该rpc请求后，由leader负责写入日志，在applych中收到后，置相关shards为正常状态，更新判重数组table和数据data，还要保证由配置变更由集群a发送给集群b的PushShardRPC只会被执行一次，具体方法是若rpc的Num与目标集群节点配置Num相等且leader相关shard状态为不可用时，则该RPC还未被执行过，写入日志，否则不再执行。当PushShardRPC请求完成后，为了清除源集群中不必要的shards，目标集群发送DeleteShardRPC，以便源集群进行垃圾回收
 
