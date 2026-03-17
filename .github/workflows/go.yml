@@ -24,5 +24,8 @@ jobs:
     - name: Build
       run: go build -v ./...
 
-    - name: Test
-      run: go test -v ./...
+    - name: dev
+      run: |
+        cd src
+        cd main
+        ./test-mr-many.sh
