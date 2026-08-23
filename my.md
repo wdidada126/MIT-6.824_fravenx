@@ -858,3 +858,104 @@ Test: unreliable net, restarts, partitions, snapshots, random keys, many clients
 --- PASS: TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B (31.89s)
 PASS
 ok      6.5840/kvraft   391.454s
+
+---
+
+# 测试报告（2026-08-23，Go 1.24.2 linux/amd64）
+
+环境：Ubuntu 24.04 (WSL2)；Go 安装于 ~/.local/go（go1.24.2）；go.mod 为 go 1.15，Go 1.24 下编译通过。
+测试命令：`cd src && go test ./raft ./kvraft ./shardctrler ./shardkv`；Lab1 用 `cd src/main && ./test-mr.sh`。
+
+## 测试结果（全部 PASS）
+
+| Lab | 测试 | 结果 | 耗时 |
+|---|---|---|---|
+| Lab1 | test-mr.sh（wc/indexer/map并行/reduce并行/jobcount/early exit/crash） | PASS 7/7 | ~8min |
+| Lab2 | raft 2A 选举 | PASS | 16.6s |
+| Lab2 | raft 2B 日志复制 | PASS | 35.8s |
+| Lab2 | raft 2C 持久化 | PASS | 118.6s |
+| Lab2 | raft 2D 快照 | PASS | 139.1s |
+| Lab3 | kvraft 3A | PASS | 246.9s |
+| Lab3 | kvraft 3B | PASS | 142.2s |
+| Lab4a | shardctrler 4A | PASS | 3.0s |
+| Lab4b | shardkv 基本功能x4 | PASS | 17.7s |
+| Lab4b | shardkv 并发x3 | PASS | 32.9s |
+| Lab4b | shardkv 不可靠x3 | PASS | 19.4s |
+| Lab4b | shardkv Challengex3 | PASS | 25.8s |
+
+说明：
+- raft 全量（2A~2D）一起跑 5 分钟跑不完（2C+2D 单测约 4.3 分钟），拆开逐个跑全部通过；CI 工作流中已给足超时。
+- go vet 仅有课程自带测试代码的惯用写法警告，非错误。
+- CI 已配置：.github/workflows/test.yml（push/PR 触发，Go 1.24.x，分 5 步跑 lab1~lab4b）。
+
+---
+
+# 各 Lab 知识点与源码位置
+
+## Lab1 MapReduce（mr）
+
+知识点：
+1. MapReduce 模型：Map 按 key 哈希分 nReduce 个中间桶，Reduce 按 key 聚合；中间文件先写临时文件再原子重命名，避免读到半成品。
+2. Coordinator 调度：任务三态（idle/in-progress/completed），worker 通过 RPC 拉取任务（pull 模式）；超时未完成任务被重置，实现 crash 容错。
+3. worker 主循环：循环拉任务 -> 执行 -> 汇报结果。
+
+源码位置：
+- src/mr/coordinator.go：MakeCoordinator L168（初始化）、GetTask L44（任务分发）、ReportTask L91（任务汇报）、resetExpired L125（超时重置）、allMapsDone L139 / allReducesDone L148、Done L159
+- src/mr/worker.go：Worker L39（主循环）、runMap L94（map 任务）、runReduce L160（reduce 任务）、ihash L32（key 分桶）
+- src/mr/rpc.go：RPC 消息与 Task 结构定义
+
+## Lab2 Raft（raft）
+
+知识点：
+1. 领导选举：term + 随机超时（150-300ms）+ 过半投票 + 先到先得；票数过半转 leader。
+2. 日志复制：AppendEntries 做 prevLogIndex/prevLogTerm 一致性检查；leader 用 nextIndex/matchIndex 推进；firstIndex 快速回退优化。
+3. 安全性：只 commit 当前 term 的日志；投票时比较日志新旧（term 大者/日志长者为新）。
+4. 持久化（2C）：currentTerm/votedFor/log 三个字段 persist。
+5. 快照（2D）：Snapshot 截断 log；落后 follower 通过 InstallSnapshot 直接发快照。
+6. apply 单例：单独 applier 协程按序发 applyCh（sync.Cond 通知），保证不重不漏、无并发乱序。
+
+源码位置（src/raft/raft.go）：
+- 选举：ticker L590（超时触发选举）、RequestVote L245（投票处理）
+- 日志复制：AppendEntries L272、handleAppendEntriesReply L761（回退推进）、updateCommitIndex L554（commit 推进）
+- 持久化：persist L113 / readPersist L126
+- 快照：Snapshot L158、InstallSnapshot L346、installSnapshot L804
+- 其他：Start L430（提交入口）、applier L842、sendHeartbeat L680 / sendHeartbeatTo L724、Make L897
+
+## Lab3 KVRaft（kvraft）
+
+知识点：
+1. 线性一致性：所有读写都进 raft 日志串行执行，从 applyCh 取出后执行并回给等待的 RPC。
+2. 幂等去重：clientId + seqNo 去重表，写操作重放不重复执行（isRepeated）。
+3. leader 切换：client 遇 ErrWrongLeader / RPC 失败换 leader 重试。
+4. 快照：raft 状态超过 maxraftstate 阈值时持久化 server 状态（data + 去重表），重启读快照恢复。
+
+源码位置：
+- src/kvraft/server.go：Get L39、PutAppend L92（写日志）、isRepeated L165（幂等去重）、execute L173（apply 后执行）、getSnapshot L251 / readSnapshot L260、StartKVServer L290
+- src/kvraft/client.go：Get L43、PutAppend L75（带 clientId+seqNo 重试）
+
+## Lab4a ShardCtrler（shardctrler）
+
+知识点：
+1. 配置版本：configs 数组按 Num 递增保存每届配置快照，Query 支持历史版本查询。
+2. Rebalance：维护 gid->shard 集合，取分片最多/最少的组，相差 >1 时成批搬移，使各组分片尽量均衡（minimal transfer）。
+3. 状态机复制：Join/Leave/Move/Query 全部走 raft 日志执行。
+
+源码位置：
+- src/shardctrler/server.go：Join L38、Leave L73、Move L109、Query L144、doJoin L218（join+rebalance）、doLeave L251（leave+rebalance）、doMove L292、isRepeated L304
+- src/shardctrler/executer.go：execute L5（apply 循环）、applyMsg L15、reply L57
+
+## Lab4b ShardKV（shardkv）
+
+知识点：
+1. 分片状态机：Working/Missing/Adding，非 Working 的分片拒绝读写请求（checkShard）。
+2. 配置逐版应用：全部 shard 就绪才拉取下一版配置（readyForNewConfig），避免跨版本直接迁移导致数据不一致。
+3. 分片迁移：PushShardRPC 携带 data + 去重表 + 源/目标 gid + 配置 Num，重复接收不破坏数据。
+4. 垃圾回收：DeleteShardRPC 通知源集群删除已迁走的 shard（GC），否则分片残留会导致 2B 测试失败。
+5. 快照持久化：config + lastConfig + shard 状态 + data + 去重表。
+
+源码位置（src/shardkv/server.go）：
+- checkShard L57（shard 状态检查）、Get L68 / PutAppend L127、PushShard L181（接收迁移）、DeleteShard L241（GC）
+- updateConfig L323（轮询拉配置）、updateShardsState L344（状态标记）、readyForNewConfig L314
+- preparePushShardArgs L368（构造迁移数据）、sendPushShardRPC L401 / sendDeleteShardRPC L413 / sendShards L433
+- getSnapshot L450 / readSnapshot L463
+- src/shardkv/client.go：key2shard L20（key->shard 映射）、Get L64 / PutAppend L98（先查配置定位 group）
