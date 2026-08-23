@@ -23,6 +23,11 @@ jobs:
       - name: Normalize shell script line endings
         run: sed -i 's/\r$//' src/main/test-mr.sh src/main/test-mr-many.sh
 
+      # 库包编译检查（mrapps/main 下均为独立小程序，由 test-mr.sh 逐个编译，不能 ./...）
+      - name: Build
+        working-directory: src
+        run: go build -v ./mr ./raft ./kvraft ./shardctrler ./shardkv ./labgob ./labrpc ./porcupine ./models
+
       - name: Lab 1 - MapReduce (test-mr.sh)
         working-directory: src/main
         run: ./test-mr.sh
