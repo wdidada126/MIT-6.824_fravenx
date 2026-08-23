@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: Run all labs tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      # 兜底：确保脚本行尾为 LF（与 .gitattributes 双保险）
+      - name: Normalize shell script line endings
+        run: sed -i 's/\r$//' src/main/test-mr.sh src/main/test-mr-many.sh
+
+      - name: Lab 1 - MapReduce (test-mr.sh)
+        working-directory: src/main
+        run: ./test-mr.sh
+        timeout-minutes: 15
+
+      - name: Lab 2 - Raft (2A-2D)
+        working-directory: src
+        run: go test -timeout 1500s ./raft
+        timeout-minutes: 30
+
+      - name: Lab 3 - KVRaft (3A-3B)
+        working-directory: src
+        run: go test -timeout 1200s ./kvraft
+        timeout-minutes: 25
+
+      - name: Lab 4a - ShardCtrler (4A)
+        working-directory: src
+        run: go test -timeout 600s ./shardctrler
+        timeout-minutes: 10
+
+      - name: Lab 4b - ShardKV (4B + Challenges)
+        working-directory: src
+        run: go test -timeout 1500s ./shardkv
+        timeout-minutes: 30
