@@ -1332,3 +1332,58 @@ term	TERM
 leader	LEAD
 网络分区/丢包	DROP
 论文只定义算法逻辑，不关心你怎么打印日志。
+
+## Raft 概念与项目日志命名的区别
+
+这些缩写和 `S0、S1...` 的显示格式，都是这个 Go 项目自己定义的日志约定，不是 Raft 算法强制规定的。
+
+具体区分如下：
+
+| 项目 | Raft 算法概念 | 当前代码的表示方式 |
+|---|---|---|
+| 选举超时 | 是 | 日志缩写为 `TIMR` |
+| 投票 | 是 | 日志缩写为 `VOTE` |
+| 任期 Term | 是 | 日志缩写为 `TERM` |
+| Leader | 是 | 日志缩写为 `LEAD` |
+| 网络丢包 | Raft 需要应对，但不规定日志 | 测试网络记录为 `DROP` |
+| 节点唯一编号 | 算法需要区分节点 | 当前代码使用 `S0、S1、S2...` |
+
+这些缩写定义在 `src/raft/util.go`：
+
+```go
+dDrop   logTopic = "DROP"
+dLeader logTopic = "LEAD"
+dTerm   logTopic = "TERM"
+dTimer  logTopic = "TIMR"
+dVote   logTopic = "VOTE"
+```
+
+`S0` 中的 `S` 也是日志字符串手动写出来的：
+
+```go
+Debug(dLeader, "S%d becomes leader ...", rf.me)
+```
+
+其中 `rf.me` 是当前节点在节点数组中的下标：
+
+```go
+me int
+```
+
+因此节点从 `0` 开始编号：
+
+```text
+rf.me = 0 → S0
+rf.me = 1 → S1
+rf.me = 2 → S2
+```
+
+节点数量由测试代码决定：
+
+- `TestInitialElection2A`：`servers := 3`，所以是 `S0～S2`。
+- `TestReElection2A`：`servers := 3`。
+- `TestManyElections2A`：`servers := 7`，所以是 `S0～S6`。
+
+这些定义可以在 `src/raft/test_test.go` 中看到。
+
+总结来说：Raft 规定了节点、Term、投票、Candidate、Follower 和 Leader 等概念，但不规定日志缩写、节点名称，也不规定编号必须从 0 开始。换成 `Node-A`、`server-1` 或中文日志，都不会影响 Raft 算法。
