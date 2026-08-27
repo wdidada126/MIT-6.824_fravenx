@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,8 @@ const (
 	dTrace   logTopic = "TRCE"
 	dVote    logTopic = "VOTE"
 	dWarn    logTopic = "WARN"
+	dKVOp    logTopic = "KVOP"
+	dDedup   logTopic = "DUPL"
 )
 
 func getVerbosity() int {
@@ -47,20 +50,42 @@ func getVerbosity() int {
 
 var debugStart time.Time
 var debugVerbosity int
+var debugTopics map[logTopic]bool
+
+func getTopics() map[logTopic]bool {
+	topics := make(map[logTopic]bool)
+	for _, value := range strings.Split(os.Getenv("KV_LOG_TOPICS"), ",") {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			topics[logTopic(strings.ToUpper(value))] = true
+		}
+	}
+	return topics
+}
 
 func init() {
 	debugVerbosity = getVerbosity()
+	debugTopics = getTopics()
 	debugStart = time.Now()
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
 func Debug(topic logTopic, format string, a ...interface{}) {
-	if debugVerbosity >= 1 {
+	if debugVerbosity >= 1 && (len(debugTopics) == 0 || debugTopics[topic]) {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
 		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
 		format = prefix + format
 		log.Printf(format, a...)
 	}
+}
+
+func summarizeValue(value string) string {
+	const maxRunes = 64
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return fmt.Sprintf("%s… (%d chars)", string(runes[:maxRunes]), len(runes))
 }

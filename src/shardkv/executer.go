@@ -26,6 +26,7 @@ func (kv *ShardKV) execute() {
 			kv.mu.Lock()
 			snapshot := msg.Snapshot
 			kv.readSnapshot(snapshot)
+			Debug(dSnap, "G%d/S%d installs snapshot index=%d term=%d bytes=%d config=%d keys=%d", kv.gid, kv.me, msg.SnapshotIndex, msg.SnapshotTerm, len(snapshot), kv.config.Num, len(kv.data))
 			kv.mu.Unlock()
 		}
 	}
@@ -45,6 +46,7 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) Err {
 			kv.table[clientId] = op.SeqNo
 		}
 		if msg.IsLeader && kv.table[clientId] == op.SeqNo {
+			Debug(dKVOp, "G%d/S%d applies GET index=%d client=%d seq=%d key=%q config=%d", kv.gid, kv.me, msg.CommandIndex, op.ClientId, op.SeqNo, op.Key, kv.config.Num)
 			return OK
 		}
 
@@ -57,6 +59,7 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) Err {
 			return ErrSHARDNOTREADY
 		}
 		if kv.isRepeated(op.ClientId, op.SeqNo) {
+			Debug(dDedup, "G%d/S%d skips duplicate %s index=%d client=%d seq=%d", kv.gid, kv.me, op.PutOrAppend, msg.CommandIndex, op.ClientId, op.SeqNo)
 			return ErrRepeated
 		}
 		if op.PutOrAppend == "Put" {
@@ -65,6 +68,7 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) Err {
 			kv.data[key] = kv.data[key] + value
 		}
 		kv.table[clientId] = op.SeqNo
+		Debug(dKVOp, "G%d/S%d applies %s index=%d client=%d seq=%d key=%q value=%q config=%d", kv.gid, kv.me, op.PutOrAppend, msg.CommandIndex, op.ClientId, op.SeqNo, op.Key, summarizeValue(kv.data[key]), kv.config.Num)
 		return OK
 	}
 	return ""
@@ -75,9 +79,11 @@ func (kv *ShardKV) applyConfig(msg raft.ApplyMsg) {
 	defer kv.mu.Unlock()
 	config := msg.Command.(shardctrler.Config)
 	if config.Num == kv.config.Num+1 && kv.readyForNewConfig() {
+		oldNum := kv.config.Num
 		kv.lastConfig = kv.config
 		kv.config = config
 		kv.updateShardsState()
+		Debug(dConfig, "G%d/S%d applies config %d -> %d shards=%v %s", kv.gid, kv.me, oldNum, kv.config.Num, kv.config.Shards, shardStateSummary(kv.shardsState))
 	}
 }
 
@@ -100,6 +106,7 @@ func (kv *ShardKV) applyPushShard(msg raft.ApplyMsg) Err {
 		}
 	}
 	if pushed {
+		Debug(dDedup, "G%d/S%d already installed shards=%v config=%d", kv.gid, kv.me, args.Shards, args.Num)
 		return OK
 
 	}
@@ -114,6 +121,7 @@ func (kv *ShardKV) applyPushShard(msg raft.ApplyMsg) Err {
 			kv.table[k] = v
 		}
 	}
+	Debug(dMigrate, "G%d/S%d installs shards=%v config=%d keys=%d clients=%d %s", kv.gid, kv.me, args.Shards, args.Num, len(args.Data), len(args.Table), shardStateSummary(kv.shardsState))
 	return OK
 }
 
@@ -137,6 +145,7 @@ func (kv *ShardKV) applyDeleteShard(msg raft.ApplyMsg) Err {
 			}
 		}
 		if deleted {
+			Debug(dDedup, "G%d/S%d already garbage-collected shards=%v config=%d", kv.gid, kv.me, args.Shards, args.Num)
 			return OK
 		}
 	}
@@ -147,6 +156,7 @@ func (kv *ShardKV) applyDeleteShard(msg raft.ApplyMsg) Err {
 	for _, k := range args.Keys {
 		delete(kv.data, k)
 	}
+	Debug(dMigrate, "G%d/S%d garbage-collects shards=%v config=%d keys=%d %s", kv.gid, kv.me, args.Shards, args.Num, len(args.Keys), shardStateSummary(kv.shardsState))
 	return OK
 
 }
@@ -175,6 +185,7 @@ func (kv *ShardKV) snapshot(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
 		snapshot := kv.getSnapshot()
+		Debug(dSnap, "G%d/S%d creates snapshot index=%d raftBytes=%d snapshotBytes=%d config=%d keys=%d", kv.gid, kv.me, msg.CommandIndex, kv.persister.RaftStateSize(), len(snapshot), kv.config.Num, len(kv.data))
 		go func(i int) {
 			kv.rf.Snapshot(i, snapshot)
 		}(msg.CommandIndex)

@@ -6,3 +6,5 @@ api.key
 .DS_Store
 src/bin
 logs/raft/*.log
+logs/lab3/*.log
+logs/lab4/*.log

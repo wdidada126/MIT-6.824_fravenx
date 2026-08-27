@@ -81,12 +81,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if shardMatch, shardReady := kv.checkShard(args.Key); !shardMatch || !shardReady {
 		if !shardMatch {
 			reply.Err = ErrWrongGroup
+			Debug(dKVOp, "G%d/S%d rejects GET key=%q shard=%d: wrong group in config=%d", kv.gid, kv.me, args.Key, key2shard(args.Key), kv.config.Num)
 		} else {
 			reply.Err = ErrSHARDNOTREADY
+			Debug(dKVOp, "G%d/S%d delays GET key=%q shard=%d: shard not ready in config=%d", kv.gid, kv.me, args.Key, key2shard(args.Key), kv.config.Num)
 		}
 		kv.mu.Unlock()
 		return
 	}
+	configNum := kv.config.Num
 
 	kv.mu.Unlock()
 	command := Op{}
@@ -94,12 +97,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	command.SeqNo = args.SeqNo
 	command.ClientId = args.ClientId
 	command.Key = args.Key
-	index, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		Debug(dTrace, "GET C%d seq %d wrong leader at S%d", args.ClientId, args.SeqNo, kv.me)
 		return
 	}
+	Debug(dKVOp, "G%d/S%d proposes GET client=%d seq=%d key=%q shard=%d index=%d term=%d config=%d", kv.gid, kv.me, args.ClientId, args.SeqNo, args.Key, key2shard(args.Key), index, term, configNum)
 	ch := make(chan Err, 1)
 	kv.mu.Lock()
 	kv.waitCh[index] = ch
@@ -112,6 +116,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			reply.Value = kv.data[args.Key]
 			kv.mu.Unlock()
 			reply.Err = OK
+			Debug(dKVOp, "G%d/S%d completes GET client=%d seq=%d key=%q value=%q", kv.gid, kv.me, args.ClientId, args.SeqNo, args.Key, summarizeValue(reply.Value))
 			return
 		}
 		reply.Err = str
@@ -125,7 +130,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	Debug(dTrace, "PUT C%d seq %d arrive at S%d", args.ClientId, args.SeqNo, kv.me)
 	//if kv.isLeader() == false {
 	//	reply.Err = ErrWrongLeader
 	//	return
@@ -133,19 +137,22 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	if args.SeqNo <= kv.table[args.ClientId] {
 		reply.Err = OK
-		Debug(dTrace, "PUT C%d seq %d aready done at S%d", args.ClientId, args.SeqNo, kv.me)
+		Debug(dDedup, "G%d/S%d ignores duplicate %s client=%d seq=%d key=%q", kv.gid, kv.me, args.Op, args.ClientId, args.SeqNo, args.Key)
 		kv.mu.Unlock()
 		return
 	}
 	if shardMatch, shardReady := kv.checkShard(args.Key); !shardMatch || !shardReady {
 		if !shardMatch {
 			reply.Err = ErrWrongGroup
+			Debug(dKVOp, "G%d/S%d rejects %s key=%q shard=%d: wrong group in config=%d", kv.gid, kv.me, args.Op, args.Key, key2shard(args.Key), kv.config.Num)
 		} else {
 			reply.Err = ErrSHARDNOTREADY
+			Debug(dKVOp, "G%d/S%d delays %s key=%q shard=%d: shard not ready in config=%d", kv.gid, kv.me, args.Op, args.Key, key2shard(args.Key), kv.config.Num)
 		}
 		kv.mu.Unlock()
 		return
 	}
+	configNum := kv.config.Num
 
 	kv.mu.Unlock()
 	command := Op{}
@@ -156,11 +163,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	command.PutOrAppend = args.Op
 	command.Value = args.Value
 
-	index, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	Debug(dKVOp, "G%d/S%d proposes %s client=%d seq=%d key=%q value=%q shard=%d index=%d term=%d config=%d", kv.gid, kv.me, args.Op, args.ClientId, args.SeqNo, args.Key, summarizeValue(args.Value), key2shard(args.Key), index, term, configNum)
 	ch := make(chan Err, 1)
 	kv.mu.Lock()
 	kv.waitCh[index] = ch
@@ -169,6 +177,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	select {
 	case res := <-ch:
 		reply.Err = res
+		if res == OK {
+			Debug(dKVOp, "G%d/S%d completes %s client=%d seq=%d key=%q", kv.gid, kv.me, args.Op, args.ClientId, args.SeqNo, args.Key)
+		}
 		return
 
 	case <-time.After(100 * time.Millisecond):
@@ -211,12 +222,13 @@ func (kv *ShardKV) PushShard(args *PushShardArgs, reply *PushShardReply) {
 		}
 	}
 	kv.mu.Unlock()
-	index, _, isLeader := kv.rf.Start(*args)
+	index, term, isLeader := kv.rf.Start(*args)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	Debug(dMigrate, "G%d/S%d proposes installing shards=%v config=%d keys=%d at index=%d term=%d", kv.gid, kv.me, args.Shards, args.Num, len(args.Data), index, term)
 	ch := make(chan Err, 1)
 	kv.mu.Lock()
 	kv.waitCh[index] = ch
@@ -264,11 +276,12 @@ func (kv *ShardKV) DeleteShard(args *DeleteShardArgs, reply *DeleteShardReply) {
 		}
 	}
 	kv.mu.Unlock()
-	index, _, isLeader := kv.rf.Start(*args)
+	index, term, isLeader := kv.rf.Start(*args)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	Debug(dMigrate, "G%d/S%d proposes deleting shards=%v config=%d keys=%d at index=%d term=%d", kv.gid, kv.me, args.Shards, args.Num, len(args.Keys), index, term)
 	ch := make(chan Err, 1)
 	kv.mu.Lock()
 	kv.waitCh[index] = ch
@@ -330,12 +343,13 @@ func (kv *ShardKV) updateConfig() {
 		}
 		configNum := kv.config.Num
 		kv.mu.Unlock()
-		go func() {
-			config := kv.mck.Query(configNum + 1)
-			if config.Num > configNum {
-				kv.rf.Start(config)
+		config := kv.mck.Query(configNum + 1)
+		if config.Num > configNum {
+			index, term, ok := kv.rf.Start(config)
+			if ok {
+				Debug(dConfig, "G%d/S%d proposes config %d -> %d at index=%d term=%d shards=%v", kv.gid, kv.me, configNum, config.Num, index, term, config.Shards)
 			}
-		}()
+		}
 		time.Sleep(UPDATECONFIG)
 
 	}
@@ -404,6 +418,7 @@ func (kv *ShardKV) sendPushShardRPC(args PushShardArgs) {
 		var reply PushShardReply
 		ok := srv.Call("ShardKV.PushShard", &args, &reply)
 		if ok && (reply.Err == OK) {
+			Debug(dMigrate, "G%d/S%d transfers shards=%v config=%d keys=%d", kv.gid, kv.me, args.Shards, args.Num, len(args.Data))
 			return
 		}
 	}
@@ -424,6 +439,7 @@ func (kv *ShardKV) sendDeleteShardRPC(args1 *PushShardArgs) {
 		var reply DeleteShardReply
 		ok := srv.Call("ShardKV.DeleteShard", &args, &reply)
 		if ok && (reply.Err == OK) {
+			Debug(dMigrate, "G%d/S%d receives GC acknowledgement for shards=%v config=%d keys=%d", kv.gid, kv.me, args.Shards, args.Num, len(args.Keys))
 			return
 		}
 	}
@@ -483,6 +499,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 		kv.lastConfig = lastConfig
 		kv.config = config1
 		kv.shardsState = shardsState
+		Debug(dSnap, "G%d/S%d restores snapshot bytes=%d config=%d keys=%d clients=%d %s", kv.gid, kv.me, len(data), kv.config.Num, len(kv.data), len(kv.table), shardStateSummary(kv.shardsState))
 	}
 }
 
@@ -544,6 +561,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 	kv.persister = persister
 	kv.readSnapshot(persister.ReadSnapshot())
+	Debug(dInfo, "G%d/S%d starts ShardKV maxraftstate=%d config=%d keys=%d", gid, me, maxraftstate, kv.config.Num, len(kv.data))
 	go kv.execute()
 	go kv.updateConfig()
 	go kv.sendShards()

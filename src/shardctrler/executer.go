@@ -30,6 +30,7 @@ func (sc *ShardCtrler) applyMsg(msg raft.ApplyMsg) Err {
 		return ErrWrong
 	} else if op.IsJoin {
 		if sc.isRepeated(op.ClientId, op.SeqNo) {
+			Debug(dDedup, "SC%d skips duplicate Join at index=%d client=%d seq=%d", sc.me, msg.CommandIndex, op.ClientId, op.SeqNo)
 			return ErrWrong
 		}
 		sc.doJoin(op)
@@ -37,6 +38,7 @@ func (sc *ShardCtrler) applyMsg(msg raft.ApplyMsg) Err {
 		return OK
 	} else if op.IsLeave {
 		if sc.isRepeated(op.ClientId, op.SeqNo) {
+			Debug(dDedup, "SC%d skips duplicate Leave at index=%d client=%d seq=%d", sc.me, msg.CommandIndex, op.ClientId, op.SeqNo)
 			return ErrWrong
 		}
 		sc.doLeave(op)
@@ -44,6 +46,7 @@ func (sc *ShardCtrler) applyMsg(msg raft.ApplyMsg) Err {
 		return OK
 	} else if op.IsMove {
 		if sc.isRepeated(op.ClientId, op.SeqNo) {
+			Debug(dDedup, "SC%d skips duplicate Move at index=%d client=%d seq=%d", sc.me, msg.CommandIndex, op.ClientId, op.SeqNo)
 			return ErrWrong
 		}
 		sc.doMove(op)

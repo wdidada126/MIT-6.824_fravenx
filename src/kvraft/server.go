@@ -42,6 +42,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		v := kv.data[args.Key]
 		reply.Value = v
 		reply.Err = OK
+		Debug(dDedup, "S%d serves cached GET client=%d seq=%d key=%q", kv.me, args.ClientId, args.SeqNo, args.Key)
 		kv.mu.Unlock()
 		return
 	}
@@ -52,12 +53,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	command.SeqNo = args.SeqNo
 	command.ClientId = args.ClientId
 	command.Key = args.Key
-	_, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		Debug(dTrace, "GET C%d seq %d wrong leader at S%d", args.ClientId, args.SeqNo, kv.me)
 		return
 	}
+	Debug(dClient, "S%d proposes GET client=%d seq=%d key=%q at index=%d term=%d", kv.me, args.ClientId, args.SeqNo, args.Key, index, term)
 
 	kv.mu.Lock()
 	ch := make(chan Op, 1)
@@ -72,7 +74,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		if cmpCommand(op, command) {
 			reply.Value = op.Value
 			reply.Err = OK
-			Debug(dTrace, "GET C%d seq %d return at S%d", args.ClientId, args.SeqNo, kv.me)
+			Debug(dClient, "S%d completes GET client=%d seq=%d key=%q value=%q", kv.me, args.ClientId, args.SeqNo, args.Key, summarizeValue(op.Value))
 			return
 		} else {
 			reply.Err = ErrWrong
@@ -90,11 +92,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	Debug(dTrace, "PUT C%d seq %d arrive at S%d", args.ClientId, args.SeqNo, kv.me)
 	kv.mu.Lock()
 	if args.SeqNo <= kv.table[args.ClientId] {
 		reply.Err = OK
-		Debug(dTrace, "PUT C%d seq %d aready done at S%d", args.ClientId, args.SeqNo, kv.me)
+		Debug(dDedup, "S%d ignores duplicate %s client=%d seq=%d key=%q", kv.me, args.Op, args.ClientId, args.SeqNo, args.Key)
 		kv.mu.Unlock()
 		return
 	}
@@ -108,11 +109,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	command.PutOrAppend = args.Op
 	command.Value = args.Value
 
-	_, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	Debug(dClient, "S%d proposes %s client=%d seq=%d key=%q value=%q at index=%d term=%d", kv.me, args.Op, args.ClientId, args.SeqNo, args.Key, summarizeValue(args.Value), index, term)
 
 	kv.mu.Lock()
 	ch := make(chan Op, 1)
@@ -125,7 +127,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		delete(kv.waitCh, args.ClientId)
 		kv.mu.Unlock()
 		if cmpCommand(op, command) {
-			Debug(dTrace, "PUT C%d seq %d return at S%d", args.ClientId, args.SeqNo, kv.me)
+			Debug(dClient, "S%d completes %s client=%d seq=%d key=%q", kv.me, args.Op, args.ClientId, args.SeqNo, args.Key)
 			reply.Err = OK
 			return
 		} else {
@@ -174,7 +176,6 @@ func (kv *KVServer) execute() {
 	for kv.killed() == false {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
-			Debug(dTrace, "C%d seq %d execute() at S%d", msg.Command.(Op).ClientId, msg.Command.(Op).SeqNo, kv.me)
 			op := msg.Command.(Op)
 			kv.mu.Lock()
 			kv.bytes += int(unsafe.Sizeof(Op{})) + len(op.Key) + len(op.Key) + len(op.Value) + 8
@@ -191,13 +192,16 @@ func (kv *KVServer) execute() {
 					default:
 					}
 				}
+				Debug(dKVOp, "S%d applies GET index=%d client=%d seq=%d key=%q", kv.me, msg.CommandIndex, op.ClientId, op.SeqNo, op.Key)
 			} else {
 				key := op.Key
 				value := op.Value
 				clientId := op.ClientId
 				if kv.isRepeated(op.ClientId, op.SeqNo) {
+					Debug(dDedup, "S%d skips duplicate %s at index=%d client=%d seq=%d", kv.me, op.PutOrAppend, msg.CommandIndex, op.ClientId, op.SeqNo)
 					if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate && kv.bytes > kv.maxraftstate {
 						snapshot := kv.getSnapshot()
+						Debug(dSnap, "S%d creates snapshot at index=%d raftBytes=%d snapshotBytes=%d keys=%d clients=%d", kv.me, msg.CommandIndex, kv.persister.RaftStateSize(), len(snapshot), len(kv.data), len(kv.table))
 						kv.bytes = 0
 						kv.mu.Unlock()
 						go func(i int) {
@@ -209,13 +213,13 @@ func (kv *KVServer) execute() {
 					kv.mu.Unlock()
 					continue
 				}
-				Debug(dTrace, "C%d seq %d applied at S%d", op.ClientId, op.SeqNo, kv.me)
 				if op.PutOrAppend == "Put" {
 					kv.data[key] = value
 				} else {
 					kv.data[key] = kv.data[key] + value
 				}
 				kv.table[clientId] = op.SeqNo
+				Debug(dKVOp, "S%d applies %s index=%d client=%d seq=%d key=%q value=%q", kv.me, op.PutOrAppend, msg.CommandIndex, op.ClientId, op.SeqNo, op.Key, summarizeValue(kv.data[key]))
 				_, ok := kv.waitCh[clientId]
 				if ok {
 					select {
@@ -226,6 +230,7 @@ func (kv *KVServer) execute() {
 			}
 			if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate && kv.bytes > kv.maxraftstate {
 				snapshot := kv.getSnapshot()
+				Debug(dSnap, "S%d creates snapshot at index=%d raftBytes=%d snapshotBytes=%d keys=%d clients=%d", kv.me, msg.CommandIndex, kv.persister.RaftStateSize(), len(snapshot), len(kv.data), len(kv.table))
 				kv.bytes = 0
 				kv.mu.Unlock()
 				go func(i int) {
@@ -241,6 +246,7 @@ func (kv *KVServer) execute() {
 			kv.mu.Lock()
 			snapshot := msg.Snapshot
 			kv.readSnapshot(snapshot)
+			Debug(dSnap, "S%d installs snapshot index=%d term=%d bytes=%d keys=%d clients=%d", kv.me, msg.SnapshotIndex, msg.SnapshotTerm, len(snapshot), len(kv.data), len(kv.table))
 			kv.mu.Unlock()
 		}
 
@@ -271,7 +277,7 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	} else {
 		kv.table = table
 		kv.data = data2
-
+		Debug(dSnap, "S%d restores snapshot bytes=%d keys=%d clients=%d", kv.me, len(data), len(kv.data), len(kv.table))
 	}
 }
 
@@ -307,6 +313,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.persister = persister
 	kv.readSnapshot(persister.ReadSnapshot())
 	kv.bytes = 0
+	Debug(dInfo, "S%d starts KV server maxraftstate=%d keys=%d clients=%d", kv.me, maxraftstate, len(kv.data), len(kv.table))
 	go kv.execute()
 	return kv
 }

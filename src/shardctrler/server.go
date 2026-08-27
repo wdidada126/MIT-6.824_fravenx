@@ -39,6 +39,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.mu.Lock()
 	if args.SeqNo <= sc.table[args.ClientId] {
 		reply.Err = OK
+		Debug(dDedup, "SC%d ignores duplicate Join client=%d seq=%d", sc.me, args.ClientId, args.SeqNo)
 		sc.mu.Unlock()
 		return
 	}
@@ -53,6 +54,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		reply.WrongLeader = true
 		return
 	}
+	Debug(dClient, "SC%d proposes Join client=%d seq=%d gids=%v at index=%d", sc.me, args.ClientId, args.SeqNo, sortedGroupIDs(args.Servers), index)
 	ch := make(chan Err, 1)
 
 	sc.mu.Lock()
@@ -74,6 +76,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sc.mu.Lock()
 	if args.SeqNo <= sc.table[args.ClientId] {
 		reply.Err = OK
+		Debug(dDedup, "SC%d ignores duplicate Leave client=%d seq=%d gids=%v", sc.me, args.ClientId, args.SeqNo, args.GIDs)
 		sc.mu.Unlock()
 		return
 	}
@@ -89,6 +92,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		reply.WrongLeader = true
 		return
 	}
+	Debug(dClient, "SC%d proposes Leave client=%d seq=%d gids=%v at index=%d", sc.me, args.ClientId, args.SeqNo, args.GIDs, index)
 
 	ch := make(chan Err, 1)
 	sc.mu.Lock()
@@ -110,6 +114,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	sc.mu.Lock()
 	if args.SeqNo <= sc.table[args.ClientId] {
 		reply.Err = OK
+		Debug(dDedup, "SC%d ignores duplicate Move client=%d seq=%d shard=%d gid=%d", sc.me, args.ClientId, args.SeqNo, args.Shard, args.GID)
 		sc.mu.Unlock()
 		return
 	}
@@ -126,6 +131,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		reply.WrongLeader = true
 		return
 	}
+	Debug(dClient, "SC%d proposes Move client=%d seq=%d shard=%d gid=%d at index=%d", sc.me, args.ClientId, args.SeqNo, args.Shard, args.GID, index)
 	ch := make(chan Err, 1)
 	sc.mu.Lock()
 	sc.waitCh[index] = ch
@@ -174,6 +180,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		reply.WrongLeader = true
 		return
 	}
+	Debug(dClient, "SC%d proposes Query client=%d seq=%d num=%d at index=%d", sc.me, args.ClientId, args.SeqNo, args.Num, index)
 	ch := make(chan Err, 1)
 	sc.mu.Lock()
 	sc.waitCh[index] = ch
@@ -216,7 +223,6 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 }
 
 func (sc *ShardCtrler) doJoin(op Op) {
-	println("doJoin %v at S%d", op.Servers, sc.me)
 	c := copyConfig(sc.configs[len(sc.configs)-1])
 	c.Num++
 	for k, v := range op.Servers {
@@ -246,12 +252,10 @@ func (sc *ShardCtrler) doJoin(op Op) {
 
 	}
 	sc.configs = append(sc.configs, c)
+	Debug(dConfig, "SC%d applies Join: config=%d groups=%v shards=%v", sc.me, c.Num, sortedGroupIDs(c.Groups), c.Shards)
 }
 
 func (sc *ShardCtrler) doLeave(op Op) {
-	Debug(dTrace, "doLeave %v at S%d", op.GIDs, sc.me)
-	println("doLeave %v at S%d", op.GIDs, sc.me)
-
 	c := copyConfig(sc.configs[len(sc.configs)-1])
 	c.Num++
 	for _, v := range op.GIDs {
@@ -287,10 +291,10 @@ func (sc *ShardCtrler) doLeave(op Op) {
 
 	}
 	sc.configs = append(sc.configs, c)
+	Debug(dConfig, "SC%d applies Leave gids=%v: config=%d groups=%v shards=%v", sc.me, op.GIDs, c.Num, sortedGroupIDs(c.Groups), c.Shards)
 }
 
 func (sc *ShardCtrler) doMove(op Op) {
-	println("doMove shard = %d,gid = %d at S%d\n", op.Shard, op.GID, sc.me)
 	c := copyConfig(sc.configs[len(sc.configs)-1])
 	c.Num++
 	for i, _ := range c.Shards {
@@ -299,6 +303,16 @@ func (sc *ShardCtrler) doMove(op Op) {
 		}
 	}
 	sc.configs = append(sc.configs, c)
+	Debug(dConfig, "SC%d applies Move shard=%d gid=%d: config=%d shards=%v", sc.me, op.Shard, op.GID, c.Num, c.Shards)
+}
+
+func sortedGroupIDs(groups map[int][]string) []int {
+	gids := make([]int, 0, len(groups))
+	for gid := range groups {
+		gids = append(gids, gid)
+	}
+	sort.Ints(gids)
+	return gids
 }
 
 func (sc *ShardCtrler) isRepeated(clientId, seqNo int64) bool {
