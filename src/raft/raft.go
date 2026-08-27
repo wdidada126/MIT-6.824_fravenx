@@ -120,6 +120,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedTerm)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
+	Debug(dPersist, "S%d persists term=%d votedFor=%d log=[%d..%d] bytes=%d", rf.me, rf.currentTerm, rf.votedFor, rf.log[0].Index, rf.log[len(rf.log)-1].Index, len(raftstate))
 }
 
 // restore previously persisted state.
@@ -148,6 +149,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.lastApplied = lastIncludedIndex
 		rf.commitIndex = lastIncludedIndex
+		Debug(dPersist, "S%d restores term=%d votedFor=%d log=[%d..%d] bytes=%d", rf.me, rf.currentTerm, rf.votedFor, rf.log[0].Index, rf.log[len(rf.log)-1].Index, len(data))
 	}
 }
 
@@ -278,6 +280,9 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
+		if len(args.Entries) > 0 {
+			Debug(dLog2, "S%d rejects entries from S%d: leader term %d < current term %d", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+		}
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
@@ -300,7 +305,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	reply.Term = rf.currentTerm
 	k, exists := rf.getByIndex(args.PrevLogIndex)
 	if !exists {
-		//Debug(dLog2, "S%d Index%d not in its log", rf.me, args.PrevLogIndex)
+		Debug(dLog2, "S%d rejects AppendEntries from S%d: prev index %d is missing (last index=%d)", rf.me, args.LeaderId, args.PrevLogIndex, rf.lastLogIndex())
 		reply.Success = false
 		reply.FirstIndex = -1
 		if needPersist {
@@ -310,7 +315,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	}
 	if rf.log[k].Term != args.PrevLogTerm {
-		//Debug(dLog2, "S%d term%d doesn't match at Index%d", rf.me, args.PrevLogTerm, args.PrevLogIndex)
+		Debug(dLog2, "S%d rejects AppendEntries from S%d: prev index %d has term %d, want %d", rf.me, args.LeaderId, args.PrevLogIndex, rf.log[k].Term, args.PrevLogTerm)
 		confictingTerm := rf.log[k].Term
 		i := k
 		for ; i > 0; i-- {
@@ -323,17 +328,23 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.FirstIndex = i + 1
 	} else {
 		size := len(args.Entries)
+		logChanged := false
 		for i := 1; i <= size; i++ {
-			//Debug(dLog2, "S%d add %v int log", rf.me, args.Entries[i-1])
 			if i+k < len(rf.log) && !cmpCommand(rf.log[i+k], args.Entries[i-1]) {
 				rf.log = rf.log[:i+k]
+				logChanged = true
 			}
 			if len(rf.log) <= i+k {
 				rf.log = append(rf.log, args.Entries[i-1])
+				logChanged = true
 			}
 			needPersist = true
 		}
+		if size > 0 && logChanged {
+			Debug(dLog2, "S%d accepts entries [%d..%d] from leader S%d; last index=%d", rf.me, args.Entries[0].Index, args.Entries[size-1].Index, args.LeaderId, rf.lastLogIndex())
+		}
 		if args.LeaderCommit > rf.commitIndex {
+			oldCommitIndex := rf.commitIndex
 			indexOfLastNewEntry := rf.log[k+size].Index
 			if indexOfLastNewEntry < args.LeaderCommit {
 				rf.commitIndex = indexOfLastNewEntry
@@ -341,8 +352,10 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 				rf.commitIndex = args.LeaderCommit
 			}
 			if rf.commitIndex > rf.lastApplied {
-				//Debug(dLog2, "S%d update commitIndex to %d", rf.me, rf.commitIndex)
 				rf.applyCond.Signal()
+			}
+			if oldCommitIndex != rf.commitIndex {
+				Debug(dCommit, "S%d advances commitIndex %d -> %d from leader S%d", rf.me, oldCommitIndex, rf.commitIndex, args.LeaderId)
 			}
 		}
 		reply.Success = true
@@ -452,7 +465,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	index := entry.Index
 	term := entry.Term
-	Debug(dLog, "S%d append log %v at %d", rf.me, command, index)
+	Debug(dLog, "Leader S%d accepts Start(command=%s): index=%d term=%d", rf.me, summarizeCommand(command), index, term)
 	rf.mu.Unlock()
 	go rf.sendHeartbeat() // 3A TestSpeed need
 	return index, term, true
@@ -589,8 +602,9 @@ func (rf *Raft) updateCommitIndex() bool {
 		return false
 	}
 	if x > rf.commitIndex {
-		//Debug(dLog, "S%d update commitIndex to %d", rf.me, x)
+		oldCommitIndex := rf.commitIndex
 		rf.commitIndex = x
+		Debug(dCommit, "Leader S%d advances commitIndex %d -> %d in term %d", rf.me, oldCommitIndex, rf.commitIndex, rf.currentTerm)
 		rf.applyCond.Signal()
 		return true
 	}
@@ -691,6 +705,9 @@ func (rf *Raft) heartbeat() {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -700,6 +717,9 @@ func (rf *Raft) sendHeartbeat() {
 		}
 		i := i
 		go func() {
+			if rf.killed() {
+				return
+			}
 			args := AppendEntryArgs{}
 			reply := AppendEntryReply{}
 			args.Term = currentTerm
@@ -716,10 +736,6 @@ func (rf *Raft) sendHeartbeat() {
 				for j := k + 1; j < len(rf.log); j++ {
 					args.Entries = append(args.Entries, rf.log[j])
 				}
-				//Debug(dLog, "S%d sendAppendRpc pIndex = %d entries num = %d to S%d", rf.me, rf.log[k].Index, len(args.Entries), i)
-			} else {
-				//Debug(dLog, "S%d sendHeartBeat pIndex = %d to S%d", rf.me, rf.log[k].Index, i)
-
 			}
 			args.PrevLogIndex = rf.log[k].Index
 			args.PrevLogTerm = rf.log[k].Term
@@ -727,6 +743,9 @@ func (rf *Raft) sendHeartbeat() {
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntry(i, &args, &reply)
 			if !ok {
+				if len(args.Entries) > 0 {
+					Debug(dDrop, "Leader S%d AppendEntries [%d..%d] to S%d was dropped", rf.me, args.Entries[0].Index, args.Entries[len(args.Entries)-1].Index, i)
+				}
 				return
 			}
 			rf.handleAppendEntriesReply(i, &args, &reply)
@@ -735,6 +754,9 @@ func (rf *Raft) sendHeartbeat() {
 }
 
 func (rf *Raft) sendHeartbeatTo(i int) {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
@@ -754,10 +776,6 @@ func (rf *Raft) sendHeartbeatTo(i int) {
 		for j := k + 1; j < len(rf.log); j++ {
 			args.Entries = append(args.Entries, rf.log[j])
 		}
-		//Debug(dLog, "S%d sendAppendRpc pIndex = %d entries num = %d to S%d", rf.me, rf.log[k].Index, len(args.Entries), i)
-	} else {
-		//Debug(dLog, "S%d sendHeartBeat pIndex = %d to S%d", rf.me, rf.log[k].Index, i)
-
 	}
 	args.PrevLogIndex = rf.log[k].Index
 	args.PrevLogTerm = rf.log[k].Term
@@ -765,6 +783,9 @@ func (rf *Raft) sendHeartbeatTo(i int) {
 	rf.mu.Unlock()
 	ok := rf.sendAppendEntry(i, &args, &reply)
 	if !ok {
+		if len(args.Entries) > 0 {
+			Debug(dDrop, "Leader S%d AppendEntries retry [%d..%d] to S%d was dropped", rf.me, args.Entries[0].Index, args.Entries[len(args.Entries)-1].Index, i)
+		}
 		return
 	}
 	rf.handleAppendEntriesReply(i, &args, &reply)
@@ -772,6 +793,9 @@ func (rf *Raft) sendHeartbeatTo(i int) {
 }
 
 func (rf *Raft) handleAppendEntriesReply(i int, args *AppendEntryArgs, reply *AppendEntryReply) {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
@@ -790,6 +814,7 @@ func (rf *Raft) handleAppendEntriesReply(i int, args *AppendEntryArgs, reply *Ap
 		return
 	}
 	if reply.Success == false {
+		oldNextIndex := rf.nextIndex[i]
 		if reply.FirstIndex == -1 {
 			j := k
 			for j >= 0 && rf.log[j].Term == args.PrevLogTerm {
@@ -802,12 +827,14 @@ func (rf *Raft) handleAppendEntriesReply(i int, args *AppendEntryArgs, reply *Ap
 
 		}
 		go rf.sendHeartbeatTo(i)
-		//Debug(dLog, "S%d set nextIndex[%d] to %d", rf.me, i, rf.nextIndex[i])
+		Debug(dLog2, "Leader S%d backtracks nextIndex[%d] %d -> %d", rf.me, i, oldNextIndex, rf.nextIndex[i])
 	} else {
 		if args.PrevLogIndex+len(args.Entries) > rf.matchIndex[i] {
 			rf.nextIndex[i] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[i] = args.PrevLogIndex + len(args.Entries)
-			//Debug(dLog, "S%d set matchIndex[%d] to %d", rf.me, i, rf.matchIndex[i])
+			if len(args.Entries) > 0 {
+				Debug(dLog2, "Leader S%d receives replication ack from S%d: matchIndex=%d nextIndex=%d", rf.me, i, rf.matchIndex[i], rf.nextIndex[i])
+			}
 			if rf.updateCommitIndex() {
 				go rf.sendHeartbeat()
 			}
@@ -888,7 +915,7 @@ func (rf *Raft) applier() {
 			rf.lastApplied = j
 			rf.mu.Unlock()
 			for _, msg := range msgs {
-				//Debug(dCommit, "S%d apply %v", rf.me, msg)
+				Debug(dCommit, "S%d applies index=%d command=%s", rf.me, msg.CommandIndex, summarizeCommand(msg.Command))
 				rf.applyCh <- msg
 			}
 			rf.mu.Lock()
@@ -930,7 +957,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedTerm = 0
 	rf.installSnapshotMsg = ApplyMsg{}
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	persistedState := persister.ReadRaftState()
+	rf.readPersist(persistedState)
+	if len(persistedState) == 0 {
+		Debug(dPersist, "S%d starts with fresh persistent state", rf.me)
+	}
 	rf.currentSnapshot = persister.ReadSnapshot()
 	//Debug(dTrace, "S%d alive now ", rf.me)
 	// start ticker goroutine to start elections

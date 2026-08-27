@@ -1387,3 +1387,306 @@ rf.me = 2 → S2
 这些定义可以在 `src/raft/test_test.go` 中看到。
 
 总结来说：Raft 规定了节点、Term、投票、Candidate、Follower 和 Leader 等概念，但不规定日志缩写、节点名称，也不规定编号必须从 0 开始。换成 `Node-A`、`server-1` 或中文日志，都不会影响 Raft 算法。
+
+---
+
+# Raft 2B：日志复制、提交与应用
+
+2A 解决“谁是 Leader”，2B 继续解决“Leader 怎样让多数节点保存相同的命令”。
+
+## 运行和保存 2B 日志
+
+在项目根目录运行全部 2B 测试：
+
+```bash
+./scripts/run-raft-2b.sh
+```
+
+日志会保存在：
+
+```text
+logs/raft/2b-时间戳.log
+```
+
+刚开始学习时，建议先单独运行基础一致性测试：
+
+```bash
+./scripts/run-raft-2b.sh '^TestBasicAgree2B$'
+```
+
+然后依次观察 Follower 掉线、重新加入和日志冲突回退：
+
+```bash
+./scripts/run-raft-2b.sh '^TestFollowerFailure2B$'
+./scripts/run-raft-2b.sh '^TestRejoin2B$'
+./scripts/run-raft-2b.sh '^TestBackup2B$'
+```
+
+脚本内部设置了：
+
+```bash
+VERBOSE=1
+RAFT_LOG_TOPICS=TEST,LEAD,TERM,LOG1,LOG2,CMIT
+```
+
+如果直接使用 `go test`，可以这样保存日志：
+
+```bash
+cd src
+VERBOSE=1 RAFT_LOG_TOPICS=LEAD,TERM,LOG1,LOG2,CMIT \
+  go test ./raft -run '^TestBasicAgree2B$' -count=1 -v 2>&1 \
+  | tee ../logs/raft/2b-basic.log
+```
+
+## 2B 新增日志主题
+
+| 缩写 | 含义 |
+|---|---|
+| `LOG1` | Leader 接受 `Start()`，把命令加入自己的日志 |
+| `LOG2` | AppendEntries、一致性检查、复制确认以及 `nextIndex` 回退 |
+| `CMIT` | `commitIndex` 前进，或者日志通过 `applyCh` 应用 |
+| `LEAD` | 节点成为 Leader |
+| `TERM` | 任期或角色发生变化 |
+
+空的心跳不会输出 `LOG2`，只有真正携带日志或者引起复制状态变化时才重点记录。
+
+## 从日志观察一次完整复制
+
+典型日志如下：
+
+```text
+LOG1 Leader S2 accepts Start(command=100): index=1 term=1
+LOG2 S1 accepts entries [1..1] from leader S2; last index=1
+LOG2 Leader S2 receives replication ack from S1: matchIndex=1 nextIndex=2
+CMIT Leader S2 advances commitIndex 0 -> 1 in term 1
+CMIT S2 applies index=1 command=100
+CMIT S1 advances commitIndex 0 -> 1 from leader S2
+CMIT S1 applies index=1 command=100
+```
+
+对应的算法过程是：
+
+```text
+测试器调用 Leader.Start(command)
+→ Leader 将 Entry 追加到本地 log
+→ Leader 通过 AppendEntries 复制给 Follower
+→ Follower 检查 prevLogIndex 和 prevLogTerm
+→ Follower 保存 Entry 并返回成功
+→ Leader 更新该 Follower 的 matchIndex 和 nextIndex
+→ 多数节点已经保存 Entry
+→ Leader 推进 commitIndex
+→ Leader 通过 applyCh 应用 Entry
+→ 后续心跳携带 LeaderCommit
+→ Follower 推进 commitIndex 并应用 Entry
+```
+
+注意：`Start()` 返回成功只代表当前节点认为自己是 Leader，并已经把命令加入本地日志，不代表命令已经提交。必须在多数节点确认后，才能看到 `CMIT ... advances commitIndex`。
+
+## nextIndex 和 matchIndex
+
+Leader 为每个 Follower 保存两个进度：
+
+- `nextIndex[i]`：下一次希望发给节点 `i` 的日志索引。
+- `matchIndex[i]`：已知节点 `i` 与 Leader 匹配的最大日志索引。
+
+复制成功时可能看到：
+
+```text
+LOG2 Leader S0 receives replication ack from S2: matchIndex=8 nextIndex=9
+```
+
+日志冲突时可能看到：
+
+```text
+LOG2 S2 rejects AppendEntries from S0: prev index 8 has term 2, want 3
+LOG2 Leader S0 backtracks nextIndex[2] 9 -> 5
+```
+
+含义是 Follower 的日志与 Leader 不一致，Leader 向前回退 `nextIndex`，从更早的位置重新复制。
+
+## 2B 测试覆盖内容
+
+| 测试 | 主要检查内容 |
+|---|---|
+| `TestBasicAgree2B` | 基本日志复制、提交和应用 |
+| `TestRPCBytes2B` | RPC 传输字节数不能异常增长 |
+| `TestFollowerFailure2B` | 一个 Follower 掉线后，多数派仍可提交 |
+| `TestLeaderFailure2B` | Leader 掉线后重新选举并继续提交 |
+| `TestFailAgree2B` | Follower 断开并重新加入后追赶日志 |
+| `TestFailNoAgree2B` | 丢失多数派时不能提交 |
+| `TestConcurrentStarts2B` | 并发调用 `Start()` 时日志索引保持正确 |
+| `TestRejoin2B` | 旧 Leader 重新加入后的冲突日志修复 |
+| `TestBackup2B` | Follower 日志差距很大时快速回退和追赶 |
+| `TestCount2B` | 心跳及复制 RPC 数量不能过高 |
+
+## 筛选 2B 日志
+
+只看命令从写入到应用：
+
+```bash
+rg 'LOG1|CMIT' logs/raft/2b-*.log
+```
+
+只看冲突与回退：
+
+```bash
+rg 'rejects AppendEntries|backtracks nextIndex' logs/raft/2b-*.log
+```
+
+只看 Leader 和任期变化：
+
+```bash
+rg 'LEAD|TERM' logs/raft/2b-*.log
+```
+
+---
+
+# Raft 2C：持久化、崩溃恢复与不可靠网络
+
+2C 的目标是：节点崩溃并重启后，仍能恢复 Raft 的关键状态，不会在同一任期重复投票，也不会丢失已经保存的日志。
+
+## 运行和保存 2C 日志
+
+运行全部 2C 测试：
+
+```bash
+./scripts/run-raft-2c.sh
+```
+
+日志会保存在：
+
+```text
+logs/raft/2c-时间戳.log
+```
+
+完整 2C 包含 Figure 8、不可靠网络和 churn，日志很长。学习时应先运行最基础的持久化测试：
+
+```bash
+./scripts/run-raft-2c.sh '^TestPersist12C$'
+```
+
+然后逐步运行：
+
+```bash
+./scripts/run-raft-2c.sh '^TestPersist22C$'
+./scripts/run-raft-2c.sh '^TestPersist32C$'
+./scripts/run-raft-2c.sh '^TestFigure82C$'
+./scripts/run-raft-2c.sh '^TestUnreliableAgree2C$'
+```
+
+脚本默认关注：
+
+```bash
+RAFT_LOG_TOPICS=TEST,LEAD,TERM,LOG1,CMIT,PERS
+```
+
+## 2C 新增日志主题
+
+| 缩写 | 含义 |
+|---|---|
+| `PERS` | Raft 状态写入持久化存储，或者节点启动时恢复状态 |
+| `LOG1` | Leader 接收新命令并追加本地日志 |
+| `CMIT` | 提交或应用日志 |
+| `TERM` | 节点发现新任期并更新状态 |
+| `LEAD` | 新 Leader 当选，测试中也可能用它标记节点崩溃 |
+
+## 哪些状态必须持久化
+
+按照 Raft Figure 2，服务器必须持久化：
+
+- `currentTerm`：当前已知的最大任期。
+- `votedFor`：当前任期投给了哪个 Candidate。
+- `log[]`：日志条目的 `Index`、`Term` 和 `Command`。
+
+本项目为 2D 快照还会一起保存：
+
+- `lastIncludedIndex`。
+- `lastIncludedTerm`。
+
+`commitIndex` 和 `lastApplied` 不属于 Raft Figure 2 要求的持久化状态。重启后可以根据 Leader 的 `LeaderCommit` 和重新复制的日志恢复提交进度。
+
+## 从日志观察持久化与恢复
+
+写入持久化状态：
+
+```text
+PERS S1 persists term=1 votedFor=1 log=[0..1] bytes=109
+```
+
+含义是：
+
+- 节点：`S1`。
+- 当前任期：`1`。
+- 本任期投票给：`S1`，也就是自己。
+- 当前持久化日志索引范围：`0..1`。
+- 编码后的 Raft 状态大小：`109` 字节。
+
+节点重启并恢复：
+
+```text
+PERS S1 restores term=1 votedFor=1 log=[0..1] bytes=109
+```
+
+这表示新的 Raft 实例从 `Persister` 中恢复了崩溃前的 Term、投票和日志，而不是从空状态开始。
+
+一次典型的 2C 因果链：
+
+```text
+Leader 接收 command=11
+→ 日志变更后调用 persist()
+→ 多数派保存并提交 index=1
+→ 节点崩溃，内存状态消失
+→ 测试器保留 Persister 中的数据
+→ Make() 创建新的 Raft 实例
+→ readPersist() 恢复 term、votedFor 和 log
+→ 节点重新选举或接收 Leader 心跳
+→ 已恢复日志继续参与一致性检查和提交
+```
+
+重要原则是：需要持久化的状态发生变化后，必须先完成 `persist()`，再让其他协程或 RPC 观察到该状态。典型位置包括：
+
+- `currentTerm` 增加或更新。
+- `votedFor` 改变。
+- Leader 在 `Start()` 中追加日志。
+- Follower 在 `AppendEntries` 中增加、覆盖或截断日志。
+
+## 2C 测试覆盖内容
+
+| 测试 | 主要检查内容 |
+|---|---|
+| `TestPersist12C` | 基础崩溃、重启和日志恢复 |
+| `TestPersist22C` | 多节点分区、重启后的持续一致性 |
+| `TestPersist32C` | 分区 Leader/Follower 崩溃后的恢复 |
+| `TestFigure82C` | Raft 论文 Figure 8 的复杂 Leader 变更场景 |
+| `TestUnreliableAgree2C` | 丢包、延迟和重复 RPC 下的一致性 |
+| `TestFigure8Unreliable2C` | Figure 8 与不可靠网络组合 |
+| `TestReliableChurn2C` | 节点反复连接、断开、崩溃和重启 |
+| `TestUnreliableChurn2C` | churn 再叠加不可靠网络 |
+
+## 筛选 2C 日志
+
+只看持久化与恢复：
+
+```bash
+rg ' PERS ' logs/raft/2c-*.log
+```
+
+只看恢复事件：
+
+```bash
+rg ' PERS .*restores' logs/raft/2c-*.log
+```
+
+同时查看崩溃、恢复和 Leader 变化：
+
+```bash
+rg 'crashes|restores| LEAD | TERM ' logs/raft/2c-*.log
+```
+
+查看某个节点，例如 `S1` 的完整轨迹：
+
+```bash
+rg ' S1 ' logs/raft/2c-*.log
+```
+
+完整 churn 日志适合验证稳定性，不适合第一次阅读。第一次学习优先看 `TestPersist12C` 的日志，再看 `TestPersist32C` 和 `TestFigure82C`。
