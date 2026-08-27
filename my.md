@@ -1179,3 +1179,137 @@ Raft 2C/2D 持久化和快照的测试通过次数（是否稳定无 flaky）
 如果您打算把这份文档发布为技术博客或 GitHub 项目说明，我可以帮您：
 
 重新组织成“项目概览 → 各 Lab 核心设计 → 测试结果 → 实现细节 → 遇到的坑”结构
+
+---
+
+# 如何运行 2A 测试并通过日志理解 Raft
+
+这个项目不需要先启动服务。2A 测试会自动在进程内创建多个 Raft 节点、模拟网络断连并检查选举结果。
+
+## 运行 2A 测试
+
+进入 Go module 所在目录：
+
+```bash
+cd /Users/ibqo/Develop/git/github/golang/mit-6.824_fravenx/src
+```
+
+运行全部 2A：
+
+```bash
+go test ./raft -run '2A$' -count=1 -v
+```
+
+分别运行三个用例：
+
+```bash
+go test ./raft -run '^TestInitialElection2A$' -count=1 -v
+go test ./raft -run '^TestReElection2A$' -count=1 -v
+go test ./raft -run '^TestManyElections2A$' -count=1 -v
+```
+
+三个用例分别观察：
+
+- `InitialElection`：3 个节点首次选出 Leader。
+- `ReElection`：Leader 断网、重新选举、丢失多数派、恢复多数派。
+- `ManyElections`：7 个节点反复随机断开和恢复。
+- `-count=1`：禁止 Go 使用测试缓存，确保每次真的重新运行。
+
+首个用例已经实际验证，当前代码可以通过。
+
+## 打开 Raft 日志
+
+日志由 `VERBOSE` 环境变量控制，定义在 `src/raft/util.go`。
+
+```bash
+VERBOSE=1 go test ./raft -run '^TestInitialElection2A$' -count=1 -v
+```
+
+保存并实时查看：
+
+```bash
+VERBOSE=1 go test ./raft -run '2A$' -count=1 -v 2>&1 \
+  | tee /tmp/raft-2a.log
+```
+
+事后筛选关键事件：
+
+```bash
+rg 'VOTE|LEAD|TERM|TIMR|PASS|FAIL' /tmp/raft-2a.log
+```
+
+典型输出：
+
+```text
+005380 VOTE S1 become leader
+```
+
+含义是：
+
+- `005380`：程序启动后约 538 ms，单位是 0.1 ms。
+- `VOTE`：投票/选举主题。
+- `S1`：编号为 1 的 Raft 节点。
+- `become leader`：该节点获得多数票，成为 Leader。
+
+测试末尾例如：
+
+```text
+... Passed --  3.5  3  62  16040  0
+```
+
+依次表示：耗时、节点数、RPC 数、RPC 字节数、达成一致的日志条数。2A 只测试选举，所以最后通常是 `0`。
+
+## 当前日志为什么比较少
+
+当前选举路径中的很多日志被注释了，例如：
+
+- 收到、拒绝和同意投票：`src/raft/raft.go` 的 `RequestVote` 方法。
+- 选举超时及发起选举：`src/raft/raft.go` 的 `ticker` 方法。
+- 发送 `RequestVote`：`ticker` 中调用 `sendRequestVote` 的位置。
+- 成为 Leader：统计到多数票之后设置 `rf.state = LEADER` 的位置。
+
+为了学习，建议临时取消这些 `Debug(dVote, ...)` 行前面的注释。然后运行：
+
+```bash
+VERBOSE=1 go test ./raft -run '^TestReElection2A$' -count=1 -v
+```
+
+可以观察到下面的因果链：
+
+```text
+选举超时
+→ currentTerm 增加
+→ Follower 变成 Candidate
+→ 给自己投票
+→ 向其他节点发送 RequestVote
+→ Follower 接受或拒绝
+→ 获得多数票
+→ Candidate 变成 Leader
+→ Leader 发送心跳
+→ 旧 Leader 重连后看到更大 Term，退回 Follower
+```
+
+不要一开始打开每一次心跳日志，因为心跳间隔只有 100 ms，会很吵。先关注 `Term`、`Candidate`、`Vote`、`Leader` 四类变化最容易理解。
+
+## 并发与稳定性检查
+
+用 race detector 检查锁和共享状态：
+
+```bash
+VERBOSE=1 go test -race ./raft -run '2A$' -count=1 -v
+```
+
+仓库还提供了批量压力测试器 `src/raft/dtest`：
+
+```bash
+cd raft
+./dtest '2A$' -n 100 -p 4
+```
+
+保存所有轮次日志：
+
+```bash
+./dtest '2A$' -n 20 -p 4 -v -a -o /tmp/raft-2a-runs
+```
+
+学习时推荐先按 `InitialElection → ReElection → ManyElections` 的顺序单独运行，理解正确后再使用 `dtest` 压测。
