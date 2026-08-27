@@ -1690,3 +1690,671 @@ rg ' S1 ' logs/raft/2c-*.log
 ```
 
 完整 churn 日志适合验证稳定性，不适合第一次阅读。第一次学习优先看 `TestPersist12C` 的日志，再看 `TestPersist32C` 和 `TestFigure82C`。
+
+---
+
+# Lab 3A：基于 Raft 的容错 KV 服务
+
+Lab 2 实现了 Raft 共识模块。Lab 3A 在 Raft 上增加一个键值状态机，对外提供 `Get`、`Put` 和 `Append`。
+
+## 运行和保存 3A 日志
+
+在项目根目录运行全部 3A 测试：
+
+```bash
+./scripts/run-lab3a.sh
+```
+
+单独运行某个测试：
+
+```bash
+./scripts/run-lab3a.sh '^TestBasic3A$'
+./scripts/run-lab3a.sh '^TestOnePartition3A$'
+./scripts/run-lab3a.sh '^TestUnreliableOneKey3A$'
+```
+
+日志保存到：
+
+```text
+logs/lab3/3a-时间戳.log
+```
+
+脚本默认日志主题：
+
+```bash
+RAFT_LOG_TOPICS=LEAD,TERM
+KV_LOG_TOPICS=CLNT,DUPL
+```
+
+如果想观察每个副本如何 Apply 命令，可以临时打开 `KVOP`：
+
+```bash
+KV_LOG_TOPICS=CLNT,KVOP,DUPL \
+  ./scripts/run-lab3a.sh '^TestBasic3A$'
+```
+
+`TestBasic3A` 自身会执行上千条命令。阅读时可先看前几十条：
+
+```bash
+sed -n '1,80p' logs/lab3/3a-*.log
+```
+
+## 3A 应用层日志主题
+
+| 缩写 | 含义 |
+|---|---|
+| `CLNT` | KVServer 将客户端请求提交给 Raft，或者完成请求 |
+| `KVOP` | KV 状态机从 `applyCh` 收到并执行命令 |
+| `DUPL` | 根据 ClientId 和 SeqNo 检测并跳过重复请求 |
+| `LEAD` | 底层 Raft 选出 Leader |
+| `TERM` | 底层 Raft 任期或角色变化 |
+
+## 一次 Put 的完整过程
+
+典型日志：
+
+```text
+CLNT S3 proposes Put client=... seq=1 key="0" value="x" at index=1 term=1
+KVOP S3 applies Put index=1 client=... seq=1 key="0" value="x"
+CLNT S3 completes Put client=... seq=1 key="0"
+KVOP S1 applies Put index=1 client=... seq=1 key="0" value="x"
+KVOP S2 applies Put index=1 client=... seq=1 key="0" value="x"
+```
+
+对应流程：
+
+```text
+Clerk 生成 ClientId 和递增 SeqNo
+→ Clerk 向它记住的 Leader 发送 PutAppend RPC
+→ KVServer 把请求包装为 Op
+→ KVServer 调用 rf.Start(Op)
+→ Raft 将 Op 复制到多数节点并提交
+→ 每个 KVServer 从 applyCh 收到相同 Op
+→ 每个副本按相同顺序修改 data
+→ 发起请求的 Leader 通过 waitCh 唤醒 RPC handler
+→ RPC 返回 OK，Clerk 才增加 SeqNo
+```
+
+这里有两个不同层次：
+
+- Raft 的 `log[]` 保存的是等待共识的 `Op`。
+- KVServer 的 `data map[string]string` 是命令被提交后得到的状态机结果。
+
+客户端看到 `OK` 时，命令已经经过 Raft 提交并由该 KVServer Apply，而不仅仅是写进 Leader 的本地日志。
+
+## 为什么 Get 也要进入 Raft
+
+`Get` 不修改键值，但当前实现仍将它包装成 `Op` 写入 Raft。这样可以让读取排在之前所有写操作之后，并确认处理它的节点仍是有效 Leader，从而支持线性一致读。
+
+其路径是：
+
+```text
+Get RPC
+→ rf.Start(Get Op)
+→ 多数派提交
+→ Apply Get
+→ 从 data 中读取值并回复客户端
+```
+
+## 请求重试与去重
+
+网络可能出现以下情况：
+
+```text
+请求已经提交
+→ Leader 的回复丢失
+→ Clerk 超时并向其他服务器重试同一个请求
+```
+
+如果再次执行 `Append`，值会被追加两次。因此 Clerk 为每个逻辑请求携带：
+
+- `ClientId`：客户端唯一标识。
+- `SeqNo`：该客户端单调递增的请求序号。
+
+每个 KVServer 保存：
+
+```go
+table map[int64]int64 // ClientId -> 已执行的最大 SeqNo
+```
+
+当 `SeqNo <= table[ClientId]` 时，请求已经执行过，状态机不会再次修改数据，并输出 `DUPL` 日志。
+
+这实现的是在客户端按顺序、一次只发出一个请求这一前提下的“重复请求只执行一次”。
+
+## Leader 切换和 waitCh
+
+RPC handler 调用 `Start()` 后不能立即返回成功，因为命令可能永远无法提交。它会创建一个带缓冲的 `waitCh`，等待 Apply 协程通知。
+
+可能结果包括：
+
+- Apply 到相同的 ClientId/SeqNo：返回 `OK`。
+- 相同位置出现另一个 Leader 的命令：返回错误并让 Clerk 重试。
+- 等待超时：返回 `TimeOut`，Clerk 更换服务器。
+- `Start()` 发现不是 Leader：立即返回 `ErrWrongLeader`。
+
+通道必须带缓冲，避免 RPC 已经超时退出后 Apply 协程永久阻塞。
+
+## 3A 测试覆盖内容
+
+| 测试类型 | 主要检查内容 |
+|---|---|
+| `TestBasic3A` | 单客户端 Put/Get/Append |
+| `TestSpeed3A` | 请求完成速度 |
+| `TestConcurrent3A` | 多客户端并发 |
+| `TestUnreliable*3A` | 丢包、延迟和重复 RPC 下的去重与一致性 |
+| `TestOnePartition3A` | 多数派可继续服务，少数派不能提交 |
+| `TestManyPartitions*3A` | 网络分区反复变化 |
+| `TestPersist*3A` | KVServer 与 Raft 反复重启 |
+| `*Linearizable3A` | 使用 Porcupine 检查历史是否线性一致 |
+
+## 筛选 3A 日志
+
+查看 Leader 接收和完成请求：
+
+```bash
+rg ' CLNT ' logs/lab3/3a-*.log
+```
+
+只看重复请求：
+
+```bash
+rg ' DUPL ' logs/lab3/3a-*.log
+```
+
+跟踪某个客户端：
+
+```bash
+rg 'client=客户端编号' logs/lab3/3a-*.log
+```
+
+---
+
+# Lab 3B：KV 状态机快照
+
+Raft 日志会持续增长。3B 要求 KVServer 在 Raft 状态超过 `maxraftstate` 后生成快照，使 Raft 可以删除已经被状态机吸收的旧日志。
+
+## 运行和保存 3B 日志
+
+运行全部 3B：
+
+```bash
+./scripts/run-lab3b.sh
+```
+
+第一次学习最推荐运行 InstallSnapshot 用例：
+
+```bash
+./scripts/run-lab3b.sh '^TestSnapshotRPC3B$'
+```
+
+也可以观察崩溃恢复：
+
+```bash
+./scripts/run-lab3b.sh '^TestSnapshotRecover3B$'
+```
+
+日志保存到：
+
+```text
+logs/lab3/3b-时间戳.log
+```
+
+## 3B 日志主题
+
+| 缩写 | 含义 |
+|---|---|
+| `SNAP` | KVServer 创建、恢复或安装快照；Raft 截断日志 |
+| `DUPL` | 从快照恢复去重表后识别重复请求 |
+| `LEAD` / `TERM` | 快照场景中的 Leader 和任期变化 |
+
+典型日志：
+
+```text
+SNAP S1 creates snapshot at index=46 raftBytes=1052 snapshotBytes=309 keys=45 clients=2
+SNAP S1 snapshots to 46 log[46 - 46]
+SNAP S2 restores snapshot bytes=309 keys=45 clients=2
+SNAP S2 installs snapshot index=46 term=2 bytes=309 keys=45 clients=2
+```
+
+含义：
+
+1. KVServer S1 发现 Raft 状态超过阈值。
+2. 它编码 KV 数据和客户端去重表，得到 309 字节的快照。
+3. 它调用 `rf.Snapshot(46, snapshot)`，通知 Raft 索引 46 及之前的日志已不再需要。
+4. 落后的 S2 无法通过普通 AppendEntries 获得已删除的日志。
+5. Leader 改用 InstallSnapshot RPC 将快照发送给 S2。
+6. S2 恢复 `data` 和 `table`，然后从快照之后的日志继续追赶。
+
+## 快照必须包含什么
+
+当前 KV 快照编码：
+
+```text
+data   ：所有键值
+table  ：ClientId -> 最大 SeqNo
+```
+
+去重表必须一起保存。如果只恢复键值而不恢复去重表，客户端重试崩溃前已经完成的 Append 时会再次执行，破坏 exactly-once 语义。
+
+Raft 自己还会持久化：
+
+```text
+currentTerm、votedFor、剩余 log、lastIncludedIndex、lastIncludedTerm
+```
+
+KV 快照和 Raft 状态需要原子保存，防止崩溃后两者对应不上。
+
+## 快照创建和恢复路径
+
+```text
+KVServer Apply index=N
+→ 检查 persister.RaftStateSize()
+→ 编码 data 和 table
+→ rf.Snapshot(N, bytes)
+→ Raft 记录快照边界并截断 log
+```
+
+重启路径：
+
+```text
+StartKVServer
+→ persister.ReadSnapshot()
+→ readSnapshot()
+→ 恢复 data 和 table
+→ 启动 Apply 协程继续处理新日志
+```
+
+落后 Follower 路径：
+
+```text
+Leader 发现 nextIndex[follower] <= lastIncludedIndex
+→ 发送 InstallSnapshot
+→ Follower 安装快照并更新提交/应用边界
+→ 后续继续使用 AppendEntries
+```
+
+## 筛选 3B 日志
+
+只看创建快照：
+
+```bash
+rg 'creates snapshot' logs/lab3/3b-*.log
+```
+
+只看恢复或安装：
+
+```bash
+rg 'restores snapshot|installs snapshot' logs/lab3/3b-*.log
+```
+
+查看日志截断范围：
+
+```bash
+rg 'snapshots to' logs/lab3/3b-*.log
+```
+
+完整恢复测试会创建数千次快照，不适合第一次阅读。优先查看 `TestSnapshotRPC3B` 的精简日志。
+
+---
+
+# Lab 4A：Shard Controller 和配置重平衡
+
+Lab 4 将键空间划分为 10 个 shard。ShardCtrler 负责维护“每个 shard 当前属于哪个复制组”的版本化配置。
+
+## 运行和保存 4A 日志
+
+运行全部 4A：
+
+```bash
+./scripts/run-lab4a.sh
+```
+
+单独运行基础配置测试：
+
+```bash
+./scripts/run-lab4a.sh '^TestBasic4A$'
+```
+
+日志保存到：
+
+```text
+logs/lab4/4a-时间戳.log
+```
+
+脚本默认关注：
+
+```bash
+RAFT_LOG_TOPICS=LEAD,TERM
+CTR_LOG_TOPICS=CONF,CLNT,DUPL
+```
+
+## 4A 日志主题和节点名称
+
+| 表示 | 含义 |
+|---|---|
+| `SC0`、`SC1`、`SC2` | 三个 ShardCtrler 副本 |
+| `CLNT` | Controller Leader 将 Join/Leave/Move/Query 写入 Raft |
+| `CONF` | Controller 状态机生成并应用新配置 |
+| `DUPL` | 重复配置修改请求被去重 |
+
+`SC` 是本项目日志使用的 Shard Controller 缩写，不是 Raft 论文规定的名称。
+
+## Config 的结构
+
+```go
+type Config struct {
+    Num    int
+    Shards [10]int
+    Groups map[int][]string
+}
+```
+
+- `Num`：配置版本，从 0 单调增加。
+- `Shards[i]`：shard i 当前所属的 GID。
+- `Groups[gid]`：该复制组中的服务器列表。
+- 配置 0 没有任何组，所有 shard 都属于无效 GID 0。
+
+## Join、Leave、Move 和 Query
+
+- `Join`：增加一个或多个复制组，并重新平衡 shard。
+- `Leave`：删除复制组，并将它们的 shard 分配给剩余组。
+- `Move`：明确把一个 shard 移动到指定 GID。
+- `Query(-1)`：查询最新配置。
+- `Query(num)`：查询历史配置。
+
+修改操作必须通过 ShardCtrler 自己的 Raft 日志复制，使全部 Controller 副本按同一顺序产生相同配置。
+
+## 从日志观察重平衡
+
+```text
+CONF SC2 applies Join: config=1 groups=[1] shards=[1 1 1 1 1 1 1 1 1 1]
+CONF SC2 applies Join: config=2 groups=[1 2] shards=[2 2 2 2 2 1 1 1 1 1]
+CONF SC2 applies Leave gids=[1]: config=3 groups=[2] shards=[2 2 2 2 2 2 2 2 2 2]
+```
+
+解释：
+
+1. GID 1 首次加入，10 个 shard 全部给它。
+2. GID 2 加入，两个组各获得 5 个 shard。
+3. GID 1 离开，它原来的 shard 全部转给 GID 2。
+
+每个 `CONF` 通常会在 `SC0/SC1/SC2` 各出现一次，因为同一个配置修改被三个 Controller 副本 Apply。
+
+## 重平衡目标
+
+当存在 N 个有效组时，算法需要满足：
+
+- 任意两个组的 shard 数量之差不超过 1。
+- 尽量少移动已经合理分配的 shard。
+- 相同输入必须产生确定性的配置，不能依赖 Go map 的随机遍历顺序。
+
+当前实现先对 GID 排序，再反复从 shard 最多的组移动到最少的组。排序很重要，否则不同 Controller 副本可能基于相同命令产生不同配置。
+
+## 为什么保存所有历史配置
+
+ShardKV 迁移 shard 时需要知道：
+
+```text
+上一个配置中 shard 属于谁
+当前配置中 shard 属于谁
+```
+
+因此 Controller 保存 `configs[]`，以配置编号作为数组下标。`Query(num)` 必须能返回旧配置，不能只保留最新配置。
+
+## 筛选 4A 日志
+
+只看配置变化：
+
+```bash
+rg ' CONF ' logs/lab4/4a-*.log
+```
+
+查看某个 shard 的 Move：
+
+```bash
+rg 'applies Move shard=3' logs/lab4/4a-*.log
+```
+
+---
+
+# Lab 4B：分片 KV、配置推进与 shard 迁移
+
+4B 中存在多个 Raft 复制组。每个组只服务当前配置分配给自己的 shard；配置改变时，数据和去重信息必须安全地迁移到新组。
+
+## 运行和保存 4B 日志
+
+运行全部 4B 和 Challenge：
+
+```bash
+./scripts/run-lab4b.sh
+```
+
+第一次学习最推荐 Join/Leave：
+
+```bash
+./scripts/run-lab4b.sh '^TestJoinLeave$'
+```
+
+观察快照与迁移：
+
+```bash
+./scripts/run-lab4b.sh '^TestSnapshot$'
+```
+
+日志保存到：
+
+```text
+logs/lab4/4b-时间戳.log
+```
+
+脚本默认过滤掉多个 Raft 组的底层投票噪音，关注：
+
+```bash
+CTR_LOG_TOPICS=CONF
+SHARDKV_LOG_TOPICS=CONF,MIGR,SNAP,DUPL
+```
+
+如需观察客户端操作：
+
+```bash
+SHARDKV_LOG_TOPICS=CONF,MIGR,SNAP,KVOP,DUPL \
+  ./scripts/run-lab4b.sh '^TestJoinLeave$'
+```
+
+## 4B 节点名称与日志主题
+
+`G100/S2` 表示：
+
+- `G100`：GID 为 100 的复制组。
+- `S2`：该组内编号为 2 的 Raft/KV 副本。
+
+| 缩写 | 含义 |
+|---|---|
+| `CONF` | ShardCtrler 配置，或 ShardKV 提议/应用新配置 |
+| `MIGR` | PushShard、安装数据、DeleteShard 和垃圾回收 |
+| `KVOP` | 分片 KV 请求的路由、提议与 Apply |
+| `SNAP` | 包含配置和 shard 状态的 ShardKV 快照 |
+| `DUPL` | 客户端请求或迁移 RPC 的幂等处理 |
+
+## key 如何映射到 shard
+
+当前测试代码使用：
+
+```text
+shard = int(key[0]) % 10
+```
+
+客户端先计算 shard，再查看 `config.Shards[shard]` 找到 GID，然后尝试该组中的服务器。如果收到 `ErrWrongGroup`，客户端会向 ShardCtrler 查询最新配置并重新路由。
+
+## 三种 shard 状态
+
+每个 ShardKV 组维护：
+
+| 状态 | 含义 |
+|---|---|
+| `WORKING` | shard 可以正常服务，或者该组无需等待它 |
+| `MISSING` | 旧配置属于本组、新配置已转出；本组需要向新组发送数据 |
+| `ADDING` | 新配置属于本组，但数据尚未从旧组到达 |
+
+日志会直接列出状态：
+
+```text
+working=[5 6 7 8 9] missing=[0 1 2 3 4] adding=[]
+working=[5 6 7 8 9] missing=[] adding=[0 1 2 3 4]
+```
+
+第一行通常属于源组，第二行属于目标组。
+
+## 配置必须逐个推进
+
+ShardKV 只查询 `currentConfig.Num + 1`，并且只有所有 shard 都回到 `WORKING` 时才接受下一个配置：
+
+```text
+配置 N 被 Raft 提交
+→ 完成 N 引起的所有 shard 迁移和垃圾回收
+→ 所有状态回到 WORKING
+→ 查询并提交配置 N+1
+```
+
+不能从配置 1 直接跳到配置 3，否则无法确定配置 2 中每个 shard 的正确数据来源。
+
+配置查询在单一后台循环中串行执行。不能周期性创建多个共享同一 Clerk 的 Query goroutine，否则它们会并发修改 Clerk 的 SeqNo，并破坏逐配置推进顺序。
+
+## 一次完整 shard 迁移
+
+下面是一条实际日志链：
+
+```text
+CONF G100/S2 applies config 1 -> 2 ... missing=[0 1 2 3 4]
+CONF G101/S0 applies config 1 -> 2 ... adding=[0 1 2 3 4]
+MIGR G101/S0 proposes installing shards=[0 1 2 3 4] config=2 keys=5 ...
+MIGR G101/S0 installs shards=[0 1 2 3 4] config=2 keys=5 clients=1 ...
+MIGR G100/S2 transfers shards=[0 1 2 3 4] config=2 keys=5
+MIGR G100/S2 proposes deleting shards=[0 1 2 3 4] config=2 keys=5 ...
+MIGR G100/S2 garbage-collects shards=[0 1 2 3 4] config=2 keys=5 ...
+MIGR G101/S0 receives GC acknowledgement for shards=[0 1 2 3 4] config=2 keys=5
+```
+
+完整协议：
+
+```text
+ShardCtrler 产生配置 N
+→ 各组将 Config N 写入自己的 Raft
+→ 源组把转出的 shard 标记 MISSING
+→ 目标组把新接收的 shard 标记 ADDING
+→ 源组 Leader 收集对应 key/value 和去重表
+→ 源组发送 PushShard RPC
+→ 目标组 Leader 将 PushShardArgs 写入自己的 Raft
+→ 目标组所有副本 Apply：安装数据、合并去重表、状态变为 WORKING
+→ 目标组向源组发送 DeleteShard RPC
+→ 源组 Leader 将 DeleteShardArgs 写入自己的 Raft
+→ 源组所有副本删除旧数据，状态变为 WORKING
+→ 源组返回 GC 成功
+→ 两边都可以继续推进下一个配置
+```
+
+## 为什么迁移去重表
+
+假设客户端的 Append 已在旧组执行，但回复丢失。随后 shard 被迁移，客户端向新组重试相同 ClientId/SeqNo。
+
+如果只迁移键值，不迁移去重表，新组会重复执行 Append。因此 `PushShardArgs` 同时携带：
+
+- shard 对应的键值数据。
+- 各客户端已经执行的最大 SeqNo。
+
+目标组合并去重表时对每个客户端取最大值。
+
+## PushShard 和 DeleteShard 必须幂等
+
+RPC 回复可能丢失，所以迁移请求会重复发送。
+
+- 重复 PushShard 不能用旧数据覆盖已经更新的数据。
+- 重复 DeleteShard 不能影响新的配置或新写入。
+- 请求必须携带 Config Num，接收方据此判断请求是过期、未来还是当前配置。
+- 真正修改数据前，Push/Delete 都先进入目标组自己的 Raft 日志。
+
+`DUPL` 日志会标记已经安装或已经垃圾回收的迁移请求。
+
+## ShardKV 快照必须包含什么
+
+4B 快照包含：
+
+```text
+table        客户端去重表
+data         键值数据
+lastConfig   上一个配置
+config       当前配置
+shardsState  每个 shard 的 WORKING/MISSING/ADDING 状态
+```
+
+只保存数据是不够的。如果崩溃后丢失配置或 shard 状态，节点可能错误服务尚未迁入的 shard，或者忘记继续发送/清理迁移中的 shard。
+
+## Challenge 的核心目标
+
+### Challenge 1：及时删除旧 shard
+
+目标组确认安装成功后，源组通过 Raft 提交 DeleteShard，删除已迁出的键值，防止旧数据长期占用快照空间。
+
+### Challenge 2：不相关 shard 继续服务
+
+某些 shard 正在迁移时，不受影响且处于 `WORKING` 的 shard 仍应继续处理请求。不能因为一个 shard 是 `ADDING/MISSING` 就暂停整个复制组。
+
+## 4B 测试覆盖内容
+
+| 测试 | 主要检查内容 |
+|---|---|
+| `TestStaticShards` | 静态多组分片与客户端路由 |
+| `TestJoinLeave` | 组加入、离开和数据迁移 |
+| `TestSnapshot` | 快照与配置迁移组合 |
+| `TestMissChange` | 服务器错过中间配置后的逐配置追赶 |
+| `TestConcurrent1/2/3` | 配置变化期间并发读写及重启 |
+| `TestUnreliable1/2/3` | 不可靠网络下的迁移幂等性 |
+| `TestChallenge1Delete` | 源组删除已迁出的数据 |
+| `TestChallenge2Unaffected` | 不受迁移影响的 shard 保持可用 |
+| `TestChallenge2Partial` | 部分 shard 完成迁移后及时恢复服务 |
+
+## 筛选 4B 日志
+
+只看配置推进：
+
+```bash
+rg ' CONF ' logs/lab4/4b-*.log
+```
+
+只看迁移握手：
+
+```bash
+rg ' MIGR ' logs/lab4/4b-*.log
+```
+
+跟踪某个复制组：
+
+```bash
+rg 'G100/' logs/lab4/4b-*.log
+```
+
+跟踪某批 shard：
+
+```bash
+rg 'shards=\[0 1 2 3 4\]' logs/lab4/4b-*.log
+```
+
+推荐阅读顺序：
+
+```text
+4A TestBasic4A
+→ 4B TestStaticShards
+→ 4B TestJoinLeave
+→ 4B TestSnapshot
+→ 4B TestMissChange
+→ 并发/不可靠网络测试
+→ Challenge 1/2
+```
+
+## 本次全量验证结果
+
+- Lab 3A：14 个测试全部通过。
+- Lab 3B：9 个测试全部通过。
+- Lab 4A：2 个测试全部通过。
+- Lab 4B：13 个测试全部通过，包括 Challenge 1 和 Challenge 2。
+- Lab 3A、Lab 4A 和 Lab 4B 的代表性用例通过 race detector。
