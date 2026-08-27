@@ -245,25 +245,30 @@ type InstallSnapshotReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//Debug(dVote, "S%d Term %d gets Requestvote from Candidate %d Term %d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+	Debug(dVote, "S%d term %d receives RequestVote from S%d for term %d", rf.me, rf.currentTerm, args.CandidateId, args.Term)
 	if args.Term <= rf.currentTerm {
-		//Debug(dVote, "S%d reject to vote for S%d", rf.me, args.CandidateId)
+		Debug(dVote, "S%d rejects vote for S%d: candidate term %d <= current term %d", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
 	}
 
+	oldTerm := rf.currentTerm
 	rf.state = FOLLOWER
 	rf.currentTerm = args.Term
 	rf.votedFor = -1
+	Debug(dTerm, "S%d term %d -> %d and becomes follower", rf.me, oldTerm, rf.currentTerm)
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.checkLog(args.LastLogTerm, args.LastLogIndex) {
-		//Debug(dVote, "S%d vote for S%d", rf.me, args.CandidateId)
-		//Debug(dLog2, "S%d log = %v", rf.me, rf.log)
 		rf.votedFor = args.CandidateId
 		rf.resetElectionTimer()
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
+		Debug(dVote, "S%d grants vote to S%d for term %d", rf.me, args.CandidateId, rf.currentTerm)
+	} else {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		Debug(dVote, "S%d rejects vote for S%d: candidate log is not up-to-date", rf.me, args.CandidateId)
 	}
 	rf.persist()
 
@@ -277,6 +282,8 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
+	oldTerm := rf.currentTerm
+	oldState := rf.state
 	rf.resetElectionTimer()
 	needPersist := false
 	if args.Term > rf.currentTerm {
@@ -286,6 +293,9 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+	}
+	if oldTerm != rf.currentTerm || oldState != FOLLOWER {
+		Debug(dTerm, "S%d accepts leader S%d for term %d and becomes follower", rf.me, args.LeaderId, rf.currentTerm)
 	}
 	reply.Term = rf.currentTerm
 	k, exists := rf.getByIndex(args.PrevLogIndex)
@@ -597,7 +607,6 @@ func (rf *Raft) ticker() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		//Debug(dVote, "S%d electionTimer ", rf.me)
 		rf.resetElectionTimer()
 		rf.currentTerm++
 		rf.votedFor = rf.me
@@ -608,8 +617,9 @@ func (rf *Raft) ticker() {
 		lastLogTerm := rf.lastLogTerm()
 		rf.votes = make(map[int]bool)
 		rf.votes[rf.me] = true
+		Debug(dTimer, "S%d election timeout; starts election for term %d (last log index=%d term=%d)", rf.me, currentTerm, lastLogIndex, lastLogTerm)
+		Debug(dVote, "S%d votes for itself in term %d (votes=1/%d)", rf.me, currentTerm, len(rf.peers))
 		rf.mu.Unlock()
-		//Debug(dVote, "S%d Term %d starts getting votes ", rf.me, currentTerm)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
@@ -622,14 +632,16 @@ func (rf *Raft) ticker() {
 				args.CandidateId = rf.me
 				args.LastLogIndex = lastLogIndex
 				args.LastLogTerm = lastLogTerm
-				//Debug(dVote, "S%d sendRequestVote index = %d term = %d to S%d", rf.me, lastLogIndex, lastLogTerm, i)
+				Debug(dVote, "S%d sends RequestVote(term=%d) to S%d", rf.me, currentTerm, i)
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if !ok {
+					Debug(dDrop, "S%d RequestVote(term=%d) to S%d was dropped", rf.me, currentTerm, i)
 					return
 				}
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if rf.currentTerm < reply.Term {
+					Debug(dTerm, "S%d sees higher term %d from S%d and becomes follower", rf.me, reply.Term, i)
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
 					rf.votedFor = -1
@@ -640,15 +652,16 @@ func (rf *Raft) ticker() {
 					return
 				}
 				if reply.VoteGranted == false {
-
+					Debug(dVote, "S%d receives vote rejection from S%d for term %d", rf.me, i, args.Term)
 				} else {
 					_, exists := rf.votes[i]
 					oldlen := len(rf.votes)
 					if !exists {
 						rf.votes[i] = true
+						Debug(dVote, "S%d receives vote from S%d for term %d (votes=%d/%d)", rf.me, i, args.Term, len(rf.votes), len(rf.peers))
 					}
 					if oldlen <= len(rf.peers)/2 && len(rf.votes) > len(rf.peers)/2 {
-						Debug(dVote, "S%d become leader", rf.me)
+						Debug(dLeader, "S%d becomes leader for term %d with %d votes", rf.me, rf.currentTerm, len(rf.votes))
 						rf.state = LEADER
 						//rf.addNilCommand() no need
 						rf.initNextIndex()
@@ -762,6 +775,7 @@ func (rf *Raft) handleAppendEntriesReply(i int, args *AppendEntryArgs, reply *Ap
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
+		Debug(dTerm, "S%d sees higher term %d from S%d and steps down from leader", rf.me, reply.Term, i)
 		rf.currentTerm = reply.Term
 		rf.state = FOLLOWER
 		rf.votedFor = -1

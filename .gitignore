@@ -5,3 +5,4 @@ api.key
 .idea
 .DS_Store
 src/bin
+logs/raft/*.log
