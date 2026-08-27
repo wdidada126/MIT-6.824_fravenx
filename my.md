@@ -1313,3 +1313,22 @@ cd raft
 ```
 
 学习时推荐先按 `InitialElection → ReElection → ManyElections` 的顺序单独运行，理解正确后再使用 `dtest` 压测。
+
+## 2A日志解析
+
+缩写	含义
+TIMR	选举计时器超时（election timeout）
+VOTE	投票相关事件
+TERM	任期变更
+LEAD	成为 leader
+DROP	网络消息被故意丢弃（模拟网络分区/丢包）
+节点编号：S0、S1、S2...（7个节点时到 S6）
+
+
+Raft 论文中的术语	你的日志缩写
+election timeout	TIMR
+RequestVote RPC	VOTE
+term	TERM
+leader	LEAD
+网络分区/丢包	DROP
+论文只定义算法逻辑，不关心你怎么打印日志。
